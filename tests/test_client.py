@@ -1,3 +1,6 @@
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
+
 import pytest
 import requests
 
@@ -65,6 +68,11 @@ def test_robots_rules(url, allowed):
     assert rules.can_fetch(url) is allowed
 
 
+def test_robots_rules_with_bom():
+    rules = RobotsRules.parse("\ufeffUser-agent: *\nDisallow: /my/\n", "Mozilla/5.0")
+    assert not rules.can_fetch("https://krisha.kz/my/adverts")
+
+
 def test_robots_rules_specific_group_wins():
     rules = RobotsRules.parse(ROBOTS, "Mozilla/5.0 (compatible; Googlebot/2.1)")
     assert not rules.can_fetch("https://krisha.kz/a/show/1")
@@ -114,6 +122,26 @@ def test_retries_on_429_and_network_errors():
     assert client.sleeps == [7.0, 4.0]
 
 
+def test_retry_after_http_date():
+    when = format_datetime(datetime.now(timezone.utc) + timedelta(seconds=60), usegmt=True)
+    client = make_client({
+        "https://krisha.kz/robots.txt": [FakeResponse(text="")],
+        "https://krisha.kz/a/show/1": [FakeResponse(503, headers={"Retry-After": when}), FakeResponse(text="ok")],
+    })
+    assert client.get("https://krisha.kz/a/show/1") == "ok"
+    assert 55 <= client.sleeps[0] <= 60
+
+
+@pytest.mark.parametrize("value", ["", "soon", "\u00b2", "Wed, 01 Jan 2020 00:00:00 GMT"])
+def test_unusable_retry_after_falls_back_to_backoff(value):
+    client = make_client({
+        "https://krisha.kz/robots.txt": [FakeResponse(text="")],
+        "https://krisha.kz/a/show/1": [FakeResponse(429, headers={"Retry-After": value}), FakeResponse(text="ok")],
+    })
+    assert client.get("https://krisha.kz/a/show/1") == "ok"
+    assert client.sleeps == [2.0]
+
+
 def test_gives_up_after_retries():
     client = make_client({
         "https://krisha.kz/robots.txt": [FakeResponse(text="")],
@@ -133,3 +161,13 @@ def test_defaults_to_utf8_without_charset():
     })
     client.get("https://krisha.kz/a/show/1")
     assert response.encoding == "utf-8"
+
+
+def test_robots_without_charset_is_read_as_utf8():
+    robots = requests.Response()
+    robots.status_code = 200
+    robots._content = "User-agent: *\nDisallow: /поиск/\n".encode("utf-8")
+    robots.headers["Content-Type"] = "text/plain"
+    robots.encoding = "ISO-8859-1"  # what requests picks for text/* without a charset
+    client = make_client({"https://krisha.kz/robots.txt": [robots]})
+    assert not client.allowed("https://krisha.kz/%D0%BF%D0%BE%D0%B8%D1%81%D0%BA/1")

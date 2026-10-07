@@ -47,14 +47,15 @@ class JsonLinesWriter(Writer):
 class JsonWriter(Writer):
     def __init__(self, path: Path):
         super().__init__(path)
+        self._file = open(path, "w", encoding="utf-8")  # fail on a bad path before scraping
         self._records: list[dict] = []
 
     def _write(self, record: dict) -> None:
         self._records.append(record)
 
     def close(self) -> None:
-        with open(self.path, "w", encoding="utf-8") as file:
-            json.dump(self._records, file, ensure_ascii=False, indent=2)
+        with self._file:
+            json.dump(self._records, self._file, ensure_ascii=False, indent=2)
 
 
 class CsvWriter(Writer):
@@ -65,6 +66,7 @@ class CsvWriter(Writer):
 
     def __init__(self, path: Path):
         super().__init__(path)
+        self._file = open(path, "w", encoding="utf-8-sig", newline="")  # fail on a bad path before scraping
         self._rows: list[dict] = []
 
     def _write(self, record: dict) -> None:
@@ -72,8 +74,8 @@ class CsvWriter(Writer):
 
     def close(self) -> None:
         columns = list(dict.fromkeys(key for row in self._rows for key in row))
-        with open(self.path, "w", encoding="utf-8-sig", newline="") as file:
-            writer = csv.DictWriter(file, fieldnames=columns)
+        with self._file:
+            writer = csv.DictWriter(self._file, fieldnames=columns)
             writer.writeheader()
             writer.writerows(self._rows)
 

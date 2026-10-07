@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 import random
 import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from urllib.parse import urlsplit
 
 import requests
@@ -53,8 +55,6 @@ class KrishaClient:
             raise RobotsDisallowed(f"robots.txt запрещает загрузку {url}")
         response = self._fetch(url)
         response.raise_for_status()
-        if "charset" not in response.headers.get("Content-Type", "").lower():
-            response.encoding = "utf-8"
         return response.text
 
     def allowed(self, url: str) -> bool:
@@ -85,6 +85,8 @@ class KrishaClient:
                 wait, reason = self._backoff(attempt), str(exc)
             else:
                 if response.status_code not in RETRY_STATUSES or attempt >= self.retries:
+                    if "charset" not in response.headers.get("Content-Type", "").lower():
+                        response.encoding = "utf-8"  # requests would fall back to ISO-8859-1
                     return response
                 wait = self._retry_after(response) or self._backoff(attempt)
                 reason = f"HTTP {response.status_code}"
@@ -105,5 +107,15 @@ class KrishaClient:
 
     @staticmethod
     def _retry_after(response: requests.Response) -> float | None:
-        value = response.headers.get("Retry-After", "")
-        return min(float(value), MAX_RETRY_AFTER) if value.isdigit() else None
+        """Retry-After in seconds; the header holds either seconds or an HTTP date."""
+        value = response.headers.get("Retry-After", "").strip()
+        if value.isascii() and value.isdigit():
+            return min(float(value), MAX_RETRY_AFTER)
+        try:
+            when = parsedate_to_datetime(value)
+        except (TypeError, ValueError):
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        seconds = (when - datetime.now(timezone.utc)).total_seconds()
+        return min(seconds, MAX_RETRY_AFTER) if seconds > 0 else None

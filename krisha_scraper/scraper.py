@@ -43,14 +43,19 @@ def iter_search(
         result = parse_search_page(client.get(url), url)
         if page == start_page and result.total is not None:
             log.info("Найдено объявлений: %d", result.total)
-        new_cards = [card for card in result.cards if _key(card) not in seen]
+        if result.last_page is not None and page > result.last_page:
+            log.info("Страница %d за пределами выдачи: всего страниц %d", page, result.last_page)
+            break
+        new_cards = []
+        for card in result.cards:  # paid "hot" cards can repeat a listing, even on the same page
+            if _key(card) not in seen:
+                seen.add(_key(card))
+                new_cards.append(card)
         of_pages = f" из {result.last_page}" if result.last_page else ""
         log.info("Страница %d%s: %d объявлений", page, of_pages, len(new_cards))
         if not new_cards:
             break
-        for card in new_cards:
-            seen.add(_key(card))
-            yield card
+        yield from new_cards
         if result.last_page is not None and page >= result.last_page:
             break
         page += 1
@@ -65,16 +70,28 @@ def scrape(
     details: bool = False,
     limit: int | None = None,
 ) -> int:
-    """Scrape search pages (or single listing URLs) into ``writer``; returns the record count."""
+    """Scrape search pages (or single listing URLs) into ``writer``; returns the record count.
+
+    A listing found by several of the URLs is saved once.
+    """
+    seen = set()
     count = 0
     for url in urls:
-        if listing_id_from_url(url):
-            records: Iterable[dict] = [parse_listing_page(client.get(url), url)]
+        listing_id = listing_id_from_url(url)
+        if listing_id:
+            cards: Iterable[dict] = [{"id": listing_id, "url": url}]
         else:
-            records = iter_search(client, url, max_pages=max_pages, start_page=start_page)
-            if details:
-                records = (with_details(client, card) for card in records)
-        for record in records:
+            cards = iter_search(client, url, max_pages=max_pages, start_page=start_page)
+        for card in cards:
+            if _key(card) in seen:
+                continue
+            seen.add(_key(card))
+            if listing_id:
+                record = parse_listing_page(client.get(url), url)
+            elif details:
+                record = with_details(client, card)
+            else:
+                record = card
             writer.write(record)
             count += 1
             if limit and count >= limit:

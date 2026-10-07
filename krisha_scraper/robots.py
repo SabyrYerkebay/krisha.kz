@@ -21,7 +21,7 @@ class RobotsRules:
         groups: list[tuple[list[str], list[tuple[bool, str]]]] = []
         agents: list[str] = []
         rules: list[tuple[bool, str]] = []
-        for raw_line in text.splitlines():
+        for raw_line in text.lstrip("\ufeff").splitlines():
             line = raw_line.split("#", 1)[0].strip()
             if ":" not in line:
                 continue

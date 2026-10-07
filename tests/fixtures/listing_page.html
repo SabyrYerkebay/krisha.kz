@@ -1,51 +1,80 @@
 <!DOCTYPE html>
 <html lang="ru">
+<!-- Trimmed copy of a real krisha.kz listing page structure (2026); listing data is made up. -->
 <head><meta charset="utf-8"><title>2-комнатная квартира</title></head>
 <body>
 <div class="offer__container">
-  <div class="offer__advert-title"><h1>2-комнатная квартира · 56 м² · 5/9 этаж, Абая 10 — Байтурсынова</h1></div>
+  <div class="offer__advert-title"><h1> 2-комнатная квартира · 56 м² · 5/9 этаж, Абая 10 </h1></div>
+  <div class="gallery">
+    <div class="gallery__main">
+      <img src="/static/frontend/images/empty-photo-750.png" loading="lazy" alt="empty photo">
+      <a><picture><img src="https://krisha-photos.kcdn.online/webp/aa/aaa/1-750x470.jpg" alt=""></picture></a>
+    </div>
+    <ul class="gallery__small-list">
+      <li><div class="gallery__small-item active" data-photo-url="https://krisha-photos.kcdn.online/webp/aa/aaa/1-750x470.jpg" data-cur-index="0"></div></li>
+      <li><div class="gallery__small-item" data-photo-url="https://krisha-photos.kcdn.online/webp/aa/aaa/2-750x470.jpg" data-cur-index="1"></div></li>
+    </ul>
+  </div>
   <div class="offer__sidebar-header">
-    <div class="offer__price">25&nbsp;000&nbsp;000 <span class="tenge">〒</span></div>
+    <div class="offer__price"> 25&nbsp;000&nbsp;000&nbsp;<span class="currency-sign offer__currency">₸</span></div>
   </div>
   <div class="offer__short-description">
-    <div class="offer__info-item" data-name="map.complex">
+    <div class="offer__info-item">
       <div class="offer__info-title">Город</div>
-      <div class="offer__advert-short-info">Алматы, Алмалинский р-н</div>
+      <div class="offer__info-border-bottom"></div>
+      <div class="offer__location offer__advert-short-info">
+        <span>Алматы, Алмалинский р-н</span>
+        <a href="javascript:;" class="btm-map">показать на карте</a>
+      </div>
     </div>
     <div class="offer__info-item" data-name="flat.building">
       <div class="offer__info-title">Тип дома</div>
+      <div class="offer__info-border-bottom"></div>
       <div class="offer__advert-short-info">кирпичный</div>
     </div>
     <div class="offer__info-item" data-name="house.year">
       <div class="offer__info-title">Год постройки</div>
+      <div class="offer__info-border-bottom"></div>
       <div class="offer__advert-short-info">1985</div>
     </div>
-    <div class="offer__info-item" data-name="flat.renovation">
-      <div class="offer__info-title">Состояние</div>
-      <div class="offer__advert-short-info">хорошее</div>
+    <div class="offer__info-item" data-name="flat.floor">
+      <div class="offer__info-title">Этаж</div>
+      <div class="offer__info-border-bottom"></div>
+      <div class="offer__advert-short-info">5 из 9</div>
     </div>
   </div>
-  <div class="offer__location offer__advert-short-info"><span>Алматы, Алмалинский р-н, Абая 10</span></div>
-  <div class="offer__parameters">
-    <dl><dt data-name="flat.toilet">Санузел</dt><dd>раздельный</dd></dl>
-    <dl><dt data-name="flat.balcony">Балкон</dt><dd>балкон</dd></dl>
-    <dl><dt data-name="flat.building">Тип дома</dt><dd>дубль, не должен перезаписать</dd></dl>
-  </div>
   <div class="offer__description">
+    <div class="offer__bio-title">Описание</div>
     <div class="text">
-      <p>Продаётся светлая квартира.</p>
-      <p>Рядом школа и парк.</p>
+      <div class="js-description a-text a-text-white-spaces">Продаётся светлая квартира.
+
+Рядом школа и парк.</div>
+      <button class="a-description__btn js-descr-translate-btn">Перевести</button>
+      <div class="js-description-loader"></div>
+      <div class="a-description__translate-warning hidden js-descr-warning-block">
+        <span>Перевод может быть неточным</span>
+        <button class="a-description__btn js-descr-show-original-btn">Показать оригинал</button>
+      </div>
+    </div>
+    <div class="offer__parameters">
+      <dl><dt data-name="flat.toilet">Санузел</dt><dd>раздельный</dd></dl>
+      <dl><dt data-name="flat.balcony">Балкон</dt><dd>балкон</dd></dl>
+      <dl><dt data-name="flat.building">Тип дома</dt><dd>дубль, не должен перезаписать</dd></dl>
     </div>
   </div>
 </div>
 <script id="jsdata">
-  window.data = {"advert": {"id": 1000001, "title": "2-комнатная квартира", "price": 25000000,
-    "addressTitle": "Абая 10 — Байтурсынова",
-    "map": {"lat": 43.238949, "lon": 76.889709, "zoom": 16},
-    "photos": [{"src": "https://alakt-photos-kr.kcdn.kz/webp/1-full.webp", "w": 750},
-               {"src": "https://alakt-photos-kr.kcdn.kz/webp/2-full.webp", "w": 750},
-               {"src": "https://alakt-photos-kr.kcdn.kz/webp/1-full.webp", "w": 750}]}};
-  window.digitalData = {};
+        window.data = {"advert": {"id": 1000001, "storage": "live", "price": 25000000,
+          "photos": [{"src": "https://krisha-photos.kcdn.online/webp/aa/aaa/1-full.jpg", "w": 1200, "h": 900},
+                     {"src": "https://krisha-photos.kcdn.online/webp/aa/aaa/2-full.jpg", "w": 1200, "h": 900},
+                     {"src": "https://krisha-photos.kcdn.online/webp/aa/aaa/1-full.jpg", "w": 1200, "h": 900}],
+          "title": "2-комнатная квартира · 56 м² · 5/9 этаж", "addressTitle": "Абая 10",
+          "userType": "specialist", "square": 56, "rooms": 2, "status": "live",
+          "map": {"lat": 43.238949, "lon": 76.889709, "zoom": 17, "type": null},
+          "address": {"district": "Almalinskiy_r-n", "country": "Kazahstan", "city": "Almaty", "street": "Abaya", "house_num": "10"}},
+        "adverts": [{"id": 1000001, "city": "Алматы", "fullAddress": "Алматы, Алмалинский р-н, Абая 10",
+          "price": 25000000, "priceM2": 446429, "createdAt": "2026-09-20", "addedAt": "2026-10-05"}]};
+        window.digitalData = {};
 </script>
 </body>
 </html>

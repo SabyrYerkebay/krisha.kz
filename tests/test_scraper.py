@@ -81,6 +81,36 @@ def test_iter_search_respects_max_pages_and_start_page():
     assert [card["id"] for card in cards] == [40, 50]
 
 
+def test_iter_search_drops_duplicates_on_same_page():
+    # paid "hot" cards can show the same listing twice on one page
+    client = FakeClient({page_url(SEARCH_URL, 1): search_html([1, 2, 1], last_page=1)})
+    assert [card["id"] for card in iter_search(client, SEARCH_URL)] == [1, 2]
+
+
+def test_iter_search_start_page_past_last_page():
+    # krisha.kz serves the last page for out-of-range numbers; its paginator tells us so
+    client = FakeClient({page_url(SEARCH_URL, 10): search_html([51, 52], last_page=5)})
+    assert list(iter_search(client, SEARCH_URL, start_page=10)) == []
+
+
+def test_scrape_dedups_across_urls(tmp_path):
+    rooms_url = SEARCH_URL + "?das[live.rooms]=2"
+    client = FakeClient({
+        page_url(SEARCH_URL, 1): search_html([1, 2], last_page=1),
+        # the second search starts with listings already saved, then has a new one
+        page_url(rooms_url, 1): search_html([2, 1], last_page=2),
+        page_url(rooms_url, 2): search_html([5], last_page=2),
+        "https://krisha.kz/a/show/5": listing_html(5),
+    })
+    out = tmp_path / "out.jsonl"
+    with open_writer(out) as writer:
+        count = scrape(client, [SEARCH_URL, rooms_url, "https://krisha.kz/a/show/5"], writer)
+
+    ids = [json.loads(line)["id"] for line in out.read_text(encoding="utf-8").splitlines()]
+    assert (count, ids) == (3, [1, 2, 5])
+    assert "https://krisha.kz/a/show/5" not in client.requested
+
+
 def test_scrape_with_details_and_limit(tmp_path):
     client = FakeClient({
         page_url(SEARCH_URL, 1): search_html([1, 2, 3], last_page=1),
@@ -128,3 +158,10 @@ def test_csv_flattens_params_and_photos(tmp_path):
 def test_open_writer_rejects_unknown_format(tmp_path):
     with pytest.raises(ValueError):
         open_writer(tmp_path / "out.xlsx")
+
+
+@pytest.mark.parametrize("name", ["out.csv", "out.json", "out.jsonl"])
+def test_open_writer_fails_on_bad_path_before_scraping(tmp_path, name):
+    (tmp_path / name).mkdir()
+    with pytest.raises(OSError):
+        open_writer(tmp_path / name)
