@@ -97,8 +97,10 @@ class KrishaClient:
                     if "charset" not in response.headers.get("Content-Type", "").lower():
                         response.encoding = "utf-8"  # requests would fall back to ISO-8859-1
                     return response
-                throttled = response.status_code in THROTTLE_STATUSES
-                wait = self._retry_after(response) or self._backoff(attempt, throttled)
+                if response.status_code in THROTTLE_STATUSES:  # a short Retry-After would not clear a block
+                    wait = max(self._retry_after(response) or 0.0, self._backoff(attempt, throttled=True))
+                else:
+                    wait = self._retry_after(response) or self._backoff(attempt)
                 reason = f"HTTP {response.status_code}"
             attempt += 1
             log.warning("%s: %s, повтор %d/%d через %.0f с", url, reason, attempt, self.retries, wait)
@@ -116,7 +118,8 @@ class KrishaClient:
         if response.status_code in THROTTLE_STATUSES:
             raise SiteBlocked(
                 f"krisha.kz ограничил доступ (HTTP {response.status_code}) для {url}. "
-                "Подождите и запустите снова, лучше с большим --delay"
+                "Подождите и запустите ту же команду с --resume (лучше и с большим --delay): "
+                "уже сохранённые объявления не будут скачиваться заново"
             )
 
     @staticmethod

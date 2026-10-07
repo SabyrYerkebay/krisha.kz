@@ -129,3 +129,50 @@ def test_site_blocked_saves_collected_rows(tmp_path, monkeypatch):
 
     with open(out, encoding="utf-8-sig", newline="") as file:
         assert [row["id"] for row in csv.DictReader(file)] == ["10", "11"]
+
+
+def test_ctrl_c_during_the_final_save_is_ignored(tmp_path, monkeypatch):
+    class OnePageClient(FakeClient):
+        def get(self, url):
+            return search_html([10, 11], last_page=1)
+
+    monkeypatch.setattr(cli, "KrishaClient", OnePageClient)
+    original_dump = storage.CsvWriter._dump
+
+    def dump_with_ctrl_c(self, file):
+        signal.raise_signal(signal.SIGINT)
+        original_dump(self, file)
+
+    monkeypatch.setattr(storage.CsvWriter, "_dump", dump_with_ctrl_c)
+    handler_before = signal.getsignal(signal.SIGINT)
+    out = tmp_path / "out.csv"
+
+    assert cli.main([SEARCH_URL, "--delay", "0", "-o", str(out)]) == 0
+
+    with open(out, encoding="utf-8-sig", newline="") as file:
+        assert [row["id"] for row in csv.DictReader(file)] == ["10", "11"]
+    assert signal.getsignal(signal.SIGINT) is handler_before
+
+
+def test_resume_after_site_blocked(tmp_path, monkeypatch):
+    class BlockingClient(FakeClient):
+        def get(self, url):
+            if url == page_url(SEARCH_URL, 2):
+                raise SiteBlocked("krisha.kz ограничил доступ (HTTP 468)")
+            return search_html([10, 11], last_page=3)
+
+    class WorkingClient(FakeClient):
+        def get(self, url):
+            self.requested.append(url)
+            page = int(url.rsplit("page=", 1)[1]) if "page=" in url else 1
+            return search_html([page * 10, page * 10 + 1], last_page=3)
+
+    out = tmp_path / "out.csv"
+    monkeypatch.setattr(cli, "KrishaClient", BlockingClient)
+    assert cli.main([SEARCH_URL, "--delay", "0", "-o", str(out)]) == 1
+
+    monkeypatch.setattr(cli, "KrishaClient", WorkingClient)
+    assert cli.main([SEARCH_URL, "--delay", "0", "--resume", "-o", str(out)]) == 0
+
+    with open(out, encoding="utf-8-sig", newline="") as file:
+        assert [row["id"] for row in csv.DictReader(file)] == ["10", "11", "20", "21", "30", "31"]

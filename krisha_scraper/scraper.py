@@ -78,13 +78,15 @@ def scrape(
     start_page: int = 1,
     details: bool = False,
     limit: int | None = None,
+    skip: Iterable = (),
 ) -> int:
     """Scrape search pages (or single listing URLs) into ``writer``; returns the record count.
 
     A listing found by several of the URLs is saved once. Listing URLs are handled
-    before search URLs so their full record is the one kept.
+    before search URLs so their full record is the one kept. Listings whose id (or
+    URL) is in ``skip``, e.g. saved by an earlier run, are not fetched again.
     """
-    seen = set()
+    seen = set(skip)
     count = 0
     for url in sorted(urls, key=lambda u: listing_id_from_url(u) is None):
         listing_id = listing_id_from_url(url)

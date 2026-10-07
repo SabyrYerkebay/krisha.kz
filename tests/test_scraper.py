@@ -234,3 +234,119 @@ def test_buffered_writers_checkpoint_to_disk(tmp_path, name):
         assert rows[0]["Тип дома"] == "кирпичный"
     else:
         assert [r["id"] for r in json.loads(raw.decode("utf-8"))] == [1, 2, 3]
+
+
+@pytest.mark.parametrize("name", ["out.csv", "out.json"])
+def test_interrupted_save_keeps_the_previous_file(tmp_path, name, monkeypatch):
+    out = tmp_path / name
+    writer = open_writer(out)
+    writer.write({"id": 1})
+    writer._save()
+    before = out.read_bytes()
+
+    def dump_then_fail(file):
+        file.write("half a file")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(writer, "_dump", dump_then_fail)
+    with pytest.raises(KeyboardInterrupt):
+        writer._save()
+    assert out.read_bytes() == before
+
+
+def test_checkpoint_failure_does_not_stop_the_run(tmp_path, monkeypatch, caplog):
+    out = tmp_path / "out.csv"
+    writer = open_writer(out)
+    writer._clock = clock = FakeClock()
+    writer._saved_at = 0.0
+    clock.now = storage.CHECKPOINT_INTERVAL + 1
+
+    def locked(*args):
+        raise PermissionError("файл открыт в другой программе")
+
+    monkeypatch.setattr(storage.os, "replace", locked)
+    with caplog.at_level(logging.WARNING):
+        writer.write({"id": 1})  # the checkpoint fails, the record is kept
+    assert "попробую через минуту" in caplog.text
+    assert writer.count == 1
+
+
+def test_final_save_failure_points_to_the_tmp_file(tmp_path, monkeypatch):
+    out = tmp_path / "out.csv"
+    writer = open_writer(out)
+    writer.write({"id": 1})
+
+    def locked(*args):
+        raise PermissionError("файл открыт в другой программе")
+
+    monkeypatch.setattr(storage.os, "replace", locked)
+    monkeypatch.setattr(storage.time, "sleep", lambda seconds: None)
+    with pytest.raises(OSError, match="out.csv.tmp"):
+        writer.close()
+    assert not writer.saved
+    with open(tmp_path / "out.csv.tmp", encoding="utf-8-sig", newline="") as file:
+        assert [row["id"] for row in csv.DictReader(file)] == ["1"]
+
+
+@pytest.mark.parametrize("name", ["out.csv", "out.json", "out.jsonl"])
+def test_existing_file_is_moved_aside_without_resume(tmp_path, name):
+    out = tmp_path / name
+    with open_writer(out) as writer:
+        writer.write({"id": 1})
+    with open_writer(out) as writer:
+        writer.write({"id": 2})
+
+    prev = tmp_path / name.replace("out.", "out.prev.")
+    assert prev.exists()
+    assert prev.read_bytes() != out.read_bytes()
+
+
+@pytest.mark.parametrize("name", ["out.csv", "out.json", "out.jsonl"])
+def test_resume_keeps_saved_listings(tmp_path, name):
+    out = tmp_path / name
+    with open_writer(out) as writer:
+        writer.write({"id": 1, "url": "https://krisha.kz/a/show/1", "params": {"Этаж": "5 из 9"}})
+        writer.write({"id": 2, "url": "https://krisha.kz/a/show/2"})
+    if name.endswith(".jsonl"):  # a run killed in the middle of a line
+        with open(out, "a", encoding="utf-8") as file:
+            file.write('{"id": 3, "url": "https://kri')
+
+    writer = open_writer(out, resume=True)
+    assert (writer.resumed, writer.saved_keys) == (2, {1, 2})
+    with writer:
+        writer.write({"id": 4, "url": "https://krisha.kz/a/show/4"})
+
+    reloaded = type(writer).load(out)
+    assert [storage.record_key(r) for r in reloaded] == [1, 2, 4]
+    assert not (tmp_path / name.replace("out.", "out.prev.")).exists()
+
+
+def test_empty_file_does_not_replace_the_backup(tmp_path):
+    out = tmp_path / "out.csv"
+    with open_writer(out) as writer:
+        writer.write({"id": 1})
+    with open_writer(out):  # a run that failed before saving anything
+        pass
+    with open_writer(out):
+        pass
+
+    with open(tmp_path / "out.prev.csv", encoding="utf-8-sig", newline="") as file:
+        assert [row["id"] for row in csv.DictReader(file)] == ["1"]
+
+
+def test_resume_with_unreadable_file(tmp_path):
+    out = tmp_path / "out.json"
+    out.write_text('[{"id": 1}', encoding="utf-8")
+    with pytest.raises(ValueError, match="--resume"):
+        open_writer(out, resume=True)
+
+
+def test_scrape_skips_saved_listings(tmp_path):
+    client = FakeClient({
+        page_url(SEARCH_URL, 1): search_html([1, 2, 3], last_page=1),
+        "https://krisha.kz/a/show/3": listing_html(3),
+    })
+    out = tmp_path / "out.jsonl"
+    with open_writer(out) as writer:
+        assert scrape(client, [SEARCH_URL], writer, details=True, skip={1, 2}) == 1
+    assert client.requested == [page_url(SEARCH_URL, 1), "https://krisha.kz/a/show/3"]

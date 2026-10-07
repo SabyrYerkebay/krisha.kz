@@ -109,17 +109,27 @@ def test_unreachable_site_raises_network_error():
         client.get("https://krisha.kz/a/show/1")
 
 
-def test_retries_on_429_and_network_errors():
+def test_retries_on_server_and_network_errors():
     client = make_client({
         "https://krisha.kz/robots.txt": [FakeResponse(text="")],
         "https://krisha.kz/a/show/1": [
-            FakeResponse(429, headers={"Retry-After": "7"}),
+            FakeResponse(503, headers={"Retry-After": "7"}),
             requests.ConnectionError("reset"),
             FakeResponse(text="ok"),
         ],
     })
     assert client.get("https://krisha.kz/a/show/1") == "ok"
     assert client.sleeps == [7.0, 4.0]
+
+
+@pytest.mark.parametrize("retry_after, expected", [("5", 30.0), ("90", 90.0)])
+def test_rate_limit_waits_at_least_the_backoff(retry_after, expected):
+    client = make_client({
+        "https://krisha.kz/robots.txt": [FakeResponse(text="")],
+        "https://krisha.kz/a/show/1": [FakeResponse(429, headers={"Retry-After": retry_after}), FakeResponse(text="ok")],
+    })
+    assert client.get("https://krisha.kz/a/show/1") == "ok"
+    assert client.sleeps == [expected]
 
 
 def test_retry_after_http_date():
@@ -156,7 +166,7 @@ def test_persistent_rate_limit_raises_site_blocked():
         "https://krisha.kz/robots.txt": [FakeResponse(text="")],
         "https://krisha.kz/a/show/1": [FakeResponse(468)] * 4,
     })
-    with pytest.raises(SiteBlocked):
+    with pytest.raises(SiteBlocked, match="--resume"):
         client.get("https://krisha.kz/a/show/1")
     assert client.sleeps == [30.0, 60.0, 120.0]
 

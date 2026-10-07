@@ -4,27 +4,61 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import os
 import time
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
-CHECKPOINT_INTERVAL = 60.0  # seconds between rewrites of a CSV/JSON file during a run
+log = logging.getLogger(__name__)
+
+CHECKPOINT_INTERVAL = 60.0  # seconds between saves of a CSV/JSON file during a run
+SAVE_ATTEMPTS = 3  # the final save is retried: on Windows Excel or an antivirus can hold the file
+
+
+def record_key(record: dict):
+    """What identifies a listing across runs: its id (ints and CSV strings alike), else its URL."""
+    listing_id = record.get("id")
+    if isinstance(listing_id, str) and listing_id.isascii() and listing_id.isdigit():
+        listing_id = int(listing_id)
+    return listing_id or record.get("url") or None
+
+
+def replace_file(path: Path, encoding: str, dump: Callable) -> None:
+    """Write via a temporary file and swap it in, so the file on disk is always complete.
+
+    If the swap fails, the complete data stays in ``<name>.tmp``.
+    """
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding=encoding, newline="") as file:
+        dump(file)
+        file.flush()
+        os.fsync(file.fileno())
+    os.replace(tmp, path)
 
 
 class Writer:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, existing: Iterable[dict] = ()):
         self.path = path
-        self.count = 0
+        self.count = 0  # records written by this run
+        self.saved = False  # set once close() has stored everything
+        existing = list(existing)
+        self.resumed = len(existing)
+        self.saved_keys = {key for key in map(record_key, existing) if key is not None}
 
     def write(self, record: dict) -> None:
         self._write(record)
         self.count += 1
+        self._after_write()
 
     def _write(self, record: dict) -> None:
         raise NotImplementedError
 
-    def close(self) -> None:
+    def _after_write(self) -> None:
         pass
+
+    def close(self) -> None:
+        self.saved = True
 
     def __enter__(self):
         return self
@@ -36,49 +70,79 @@ class Writer:
 class JsonLinesWriter(Writer):
     """One JSON object per line, flushed immediately so nothing is lost on a crash."""
 
-    def __init__(self, path: Path):
-        super().__init__(path)
-        self._file = open(path, "w", encoding="utf-8")
+    def __init__(self, path: Path, existing: Iterable[dict] = ()):
+        existing = list(existing)
+        super().__init__(path, existing)
+        if existing:  # rewrite without a line a killed run may have cut short, then append
+            replace_file(path, "utf-8", lambda file: file.writelines(_json_line(r) for r in existing))
+        self._file = open(path, "a" if existing else "w", encoding="utf-8")
+
+    @staticmethod
+    def load(path: Path) -> list[dict]:
+        records = []
+        with open(path, encoding="utf-8") as file:
+            for line in file:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict):
+                    records.append(record)
+        return records
 
     def _write(self, record: dict) -> None:
-        self._file.write(json.dumps(record, ensure_ascii=False) + "\n")
+        self._file.write(_json_line(record))
         self._file.flush()
 
     def close(self) -> None:
         self._file.close()
+        super().close()
 
 
 class BufferedWriter(Writer):
     """Keeps every record and rewrites the whole file: on close and every CHECKPOINT_INTERVAL.
 
-    The checkpoints mean a run killed without a chance to save (a closed console
-    window on Windows, a power cut) loses at most the last interval.
+    Each save goes through a temporary file, so a run killed at any moment (a closed
+    console window on Windows, a power cut) leaves the previous complete save behind.
     """
 
     encoding = "utf-8"
 
-    def __init__(self, path: Path):
-        super().__init__(path)
-        self._file = open(path, "w", encoding=self.encoding, newline="")  # fail on a bad path before scraping
-        self._records: list[dict] = []
+    def __init__(self, path: Path, existing: Iterable[dict] = ()):
+        existing = list(existing)
+        super().__init__(path, existing)
+        with open(path, "a", encoding=self.encoding):  # fail on a bad path before scraping
+            pass
+        self._records: list[dict] = [self._prepare(record) for record in existing]
         self._clock = time.monotonic
         self._saved_at = self._clock()
 
     def _write(self, record: dict) -> None:
         self._records.append(self._prepare(record))
-        if self._clock() - self._saved_at >= CHECKPOINT_INTERVAL:
+
+    def _after_write(self) -> None:
+        if self._clock() - self._saved_at < CHECKPOINT_INTERVAL:
+            return
+        try:
             self._save()
+        except OSError as exc:  # e.g. the CSV is open in Excel; the next checkpoint tries again
+            log.warning("Не удалось сохранить %s (%s), попробую через минуту", self.path, exc)
+            self._saved_at = self._clock()
 
     def close(self) -> None:
-        with self._file:
-            self._save()
+        for attempt in range(1, SAVE_ATTEMPTS + 1):
+            try:
+                self._save()
+                break
+            except PermissionError as exc:
+                if attempt == SAVE_ATTEMPTS:
+                    raise OSError(f"Не удалось записать {self.path} (файл открыт в Excel?): {exc}. "
+                                  f"Все данные сохранены в {self.path.name}.tmp рядом с ним") from exc
+                time.sleep(1)
+        super().close()
 
     def _save(self) -> None:
-        self._file.seek(0)
-        self._file.truncate()
-        self._dump(self._file)
-        self._file.flush()
-        os.fsync(self._file.fileno())
+        replace_file(self.path, self.encoding, self._dump)
         self._saved_at = self._clock()
 
     def _prepare(self, record: dict) -> dict:
@@ -89,6 +153,14 @@ class BufferedWriter(Writer):
 
 
 class JsonWriter(BufferedWriter):
+    @staticmethod
+    def load(path: Path) -> list[dict]:
+        with open(path, encoding="utf-8") as file:
+            data = json.load(file)
+        if not isinstance(data, list):
+            raise ValueError("ожидался список объявлений")
+        return [record for record in data if isinstance(record, dict)]
+
     def _dump(self, file) -> None:
         json.dump(self._records, file, ensure_ascii=False, indent=2)
 
@@ -100,6 +172,11 @@ class CsvWriter(BufferedWriter):
     """
 
     encoding = "utf-8-sig"
+
+    @staticmethod
+    def load(path: Path) -> list[dict]:
+        with open(path, encoding="utf-8-sig", newline="") as file:
+            return list(csv.DictReader(file))
 
     def _prepare(self, record: dict) -> dict:
         return flatten(record)
@@ -124,11 +201,36 @@ def flatten(record: dict) -> dict:
     return row
 
 
-def open_writer(path: str | Path) -> Writer:
+def open_writer(path: str | Path, resume: bool = False) -> Writer:
+    """A writer for the file's format.
+
+    With ``resume`` the listings already in the file are kept (and reported in
+    ``saved_keys`` so they are not fetched again). Without it an existing file is
+    moved aside to ``<name>.prev<ext>`` rather than overwritten.
+    """
     path = Path(path)
     writers = {".csv": CsvWriter, ".jsonl": JsonLinesWriter, ".ndjson": JsonLinesWriter, ".json": JsonWriter}
     writer_class = writers.get(path.suffix.lower())
     if writer_class is None:
         raise ValueError(f"Неизвестный формат файла {path.name!r}: используйте .csv, .jsonl или .json")
     path.parent.mkdir(parents=True, exist_ok=True)
-    return writer_class(path)
+
+    existing: list[dict] = []
+    if path.is_file() and path.stat().st_size > 0:
+        try:
+            saved = writer_class.load(path)
+        except (ValueError, csv.Error) as exc:
+            if resume:
+                raise ValueError(f"Не удалось прочитать {path} для --resume: {exc}") from exc
+            saved = None  # unreadable, but still worth keeping
+        if resume:
+            existing = saved
+        elif saved != []:  # a file without listings must not push a real one out of .prev
+            backup = path.with_name(f"{path.stem}.prev{path.suffix}")
+            os.replace(path, backup)
+            log.warning("Файл %s уже был: старая версия перенесена в %s", path, backup.name)
+    return writer_class(path, existing)
+
+
+def _json_line(record: dict) -> str:
+    return json.dumps(record, ensure_ascii=False) + "\n"
