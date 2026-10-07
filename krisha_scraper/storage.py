@@ -13,7 +13,8 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 CHECKPOINT_INTERVAL = 60.0  # seconds between saves of a CSV/JSON file during a run
-SAVE_ATTEMPTS = 3  # the final save is retried: on Windows Excel or an antivirus can hold the file
+SAVE_ATTEMPTS = 3  # the final save is retried: on Windows Excel can hold the file for a long time
+REPLACE_ATTEMPTS = 6  # each swap is retried within ~1.5 s: an antivirus or indexer holds new files briefly
 
 
 def record_key(record: dict):
@@ -54,7 +55,14 @@ def replace_file(path: Path, encoding: str, dump: Callable) -> None:
         dump(file)
         file.flush()
         os.fsync(file.fileno())
-    os.replace(tmp, path)
+    for attempt in range(REPLACE_ATTEMPTS):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:  # Windows: [WinError 5] while another program has the file open
+            if attempt == REPLACE_ATTEMPTS - 1:
+                raise
+            time.sleep(0.05 * 2 ** attempt)
 
 
 class Writer:
@@ -105,9 +113,15 @@ class Writer:
         pass
 
     def _save_progress(self) -> None:
-        if self._progress["next_page"] or self._progress["done"]:
+        """Best effort: an older progress file only makes --resume repeat a few pages."""
+        if not (self._progress["next_page"] or self._progress["done"]):
+            return
+        try:
             replace_file(progress_path(self.path), "utf-8",
                          lambda file: json.dump(self._progress, file, ensure_ascii=False, indent=2))
+        except OSError as exc:
+            log.warning("Не удалось сохранить %s (%s): --resume может начать поиск на несколько страниц раньше",
+                        progress_path(self.path).name, exc)
 
     def close(self) -> None:
         self.saved = True

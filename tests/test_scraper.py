@@ -286,6 +286,7 @@ def test_checkpoint_failure_does_not_stop_the_run(tmp_path, monkeypatch, caplog)
         raise PermissionError("файл открыт в другой программе")
 
     monkeypatch.setattr(storage.os, "replace", locked)
+    monkeypatch.setattr(storage.time, "sleep", lambda seconds: None)
     with caplog.at_level(logging.WARNING):
         writer.write({"id": 1})  # the checkpoint fails, the record is kept
     assert "попробую через минуту" in caplog.text
@@ -509,3 +510,38 @@ def test_pages_limit_leaves_the_search_open_for_resume(tmp_path):
     with open_writer(out, resume=True) as writer:
         scrape(client, [SEARCH_URL], writer, skip=writer.saved_keys)
     assert client.requested == [page_url(SEARCH_URL, 2), page_url(SEARCH_URL, 3)]
+
+
+def test_briefly_locked_file_is_replaced_after_a_retry(tmp_path, monkeypatch):
+    # Windows: an antivirus or the search indexer holds a just-written file for a moment
+    real_replace, failures, sleeps = storage.os.replace, [PermissionError(13, "WinError 5")] * 2, []
+
+    def replace(src, dst):
+        if failures:
+            raise failures.pop()
+        real_replace(src, dst)
+
+    monkeypatch.setattr(storage.os, "replace", replace)
+    monkeypatch.setattr(storage.time, "sleep", sleeps.append)
+    out = tmp_path / "out.json"
+    storage.replace_file(out, "utf-8", lambda file: file.write("[]"))
+    assert out.read_text(encoding="utf-8") == "[]"
+    assert sleeps == [0.05, 0.1]
+
+
+def test_progress_that_cannot_be_saved_does_not_stop_the_run(tmp_path, monkeypatch, caplog):
+    out = tmp_path / "out.jsonl"
+    real_replace = storage.os.replace
+
+    def replace(src, dst):
+        if Path(dst) == storage.progress_path(out):
+            raise PermissionError(13, "WinError 5")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(storage.os, "replace", replace)
+    monkeypatch.setattr(storage.time, "sleep", lambda seconds: None)
+    with caplog.at_level(logging.WARNING):
+        with open_writer(out) as writer:
+            assert scrape(BlockOnPage(), [SEARCH_URL], writer) == 6
+    assert "несколько страниц раньше" in caplog.text
+    assert [r["id"] for r in storage.JsonLinesWriter.load(out)] == [10, 11, 20, 21, 30, 31]
