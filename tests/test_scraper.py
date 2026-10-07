@@ -100,15 +100,15 @@ def test_scrape_dedups_across_urls(tmp_path):
         # the second search starts with listings already saved, then has a new one
         page_url(rooms_url, 1): search_html([2, 1], last_page=2),
         page_url(rooms_url, 2): search_html([5], last_page=2),
-        "https://krisha.kz/a/show/5": listing_html(5),
+        "https://krisha.kz/a/show/2": listing_html(2),
     })
     out = tmp_path / "out.jsonl"
     with open_writer(out) as writer:
-        count = scrape(client, [SEARCH_URL, rooms_url, "https://krisha.kz/a/show/5"], writer)
+        count = scrape(client, [SEARCH_URL, rooms_url, "https://krisha.kz/a/show/2"], writer)
 
-    ids = [json.loads(line)["id"] for line in out.read_text(encoding="utf-8").splitlines()]
-    assert (count, ids) == (3, [1, 2, 5])
-    assert "https://krisha.kz/a/show/5" not in client.requested
+    records = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
+    assert (count, [r["id"] for r in records]) == (3, [2, 1, 5])
+    assert records[0]["lat"] == 43.2  # the explicit listing URL keeps its full record
 
 
 def test_scrape_with_details_and_limit(tmp_path):

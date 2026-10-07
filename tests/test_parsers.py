@@ -92,7 +92,7 @@ def test_parse_listing_page():
     assert listing == {
         "id": 1000001,
         "url": LISTING_URL,
-        "title": "2-комнатная квартира · 56 м² · 5/9 этаж, Абая 10",
+        "title": "2-комнатная квартира · 56 м² · 5/9 этаж",
         "rooms": 2,
         "area_m2": 56.0,
         "floor": 5,
@@ -100,7 +100,7 @@ def test_parse_listing_page():
         "price": 25_000_000,
         "price_text": "25 000 000 ₸",
         "price_m2": 446_429,
-        "address": "Алматы, Алмалинский р-н, Абая 10",
+        "address": "Алматы, Алмалинский р-н, Абая 10 — Байтурсынова",
         "city": "Алматы",
         "lat": 43.238949,
         "lon": 76.889709,
@@ -128,6 +128,7 @@ def test_parse_listing_page_without_jsdata():
     listing = parse_listing_page(listing_without_jsdata(), LISTING_URL)
 
     assert listing["id"] == 1000001  # from the URL
+    assert listing["title"] == "2-комнатная квартира · 56 м² · 5/9 этаж, Абая 10 — Байтурсынова"
     assert listing["price"] == 25_000_000
     assert listing["address"] == "Алматы, Алмалинский р-н"  # the street is only in the JSON payload
     assert listing["lat"] is None
@@ -173,6 +174,14 @@ def test_older_var_data_payload_and_address_fallback():
     assert (listing["lat"], listing["lon"]) == (51.1, 71.4)
     assert listing["photos"] == []
     assert listing["params"] == {}
+
+
+def test_title_from_h1_drops_the_street():
+    html = """<div class="offer__advert-title"><h1>1-комнатная квартира, 42 м², 15/16 этаж, Акмешит 3 — у парка</h1></div>
+        <script id="jsdata">var data = {"advert": {"id": 3, "addressTitle": "Акмешит 3 — у парка"}};</script>"""
+    listing = parse_listing_page(html)
+    assert listing["title"] == "1-комнатная квартира, 42 м², 15/16 этаж"
+    assert (listing["rooms"], listing["floor"], listing["floors_total"]) == (1, 15, 16)
 
 
 def test_summary_of_another_listing_is_ignored():

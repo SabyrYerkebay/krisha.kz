@@ -72,11 +72,12 @@ def scrape(
 ) -> int:
     """Scrape search pages (or single listing URLs) into ``writer``; returns the record count.
 
-    A listing found by several of the URLs is saved once.
+    A listing found by several of the URLs is saved once. Listing URLs are handled
+    before search URLs so their full record is the one kept.
     """
     seen = set()
     count = 0
-    for url in urls:
+    for url in sorted(urls, key=lambda u: listing_id_from_url(u) is None):
         listing_id = listing_id_from_url(url)
         if listing_id:
             cards: Iterable[dict] = [{"id": listing_id, "url": url}]

@@ -58,11 +58,18 @@ def _krisha_url(value: str) -> str:
 
 @contextmanager
 def _stop_on_termination():
-    """Turn SIGTERM/SIGHUP into KeyboardInterrupt so buffered CSV/JSON output still gets written."""
+    """Turn SIGTERM/SIGHUP into KeyboardInterrupt so buffered CSV/JSON output still gets written.
+
+    Signals already ignored (``nohup``) stay ignored. After the first one, the rest are
+    ignored too, so a repeated signal cannot cut the file short while it is being saved.
+    """
     def interrupt(signum, frame):
+        for name in previous:
+            signal.signal(getattr(signal, name), signal.SIG_IGN)
         raise KeyboardInterrupt
 
-    names = [name for name in ("SIGTERM", "SIGHUP") if hasattr(signal, name)]
+    names = [name for name in ("SIGTERM", "SIGHUP")
+             if hasattr(signal, name) and signal.getsignal(getattr(signal, name)) is not signal.SIG_IGN]
     previous = {name: signal.signal(getattr(signal, name), interrupt) for name in names}
     try:
         yield

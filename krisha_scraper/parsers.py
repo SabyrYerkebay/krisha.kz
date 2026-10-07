@@ -115,12 +115,13 @@ def parse_listing_page(html: str, url: str | None = None) -> dict:
     summary = _advert_summary(data, listing_id)
     map_data = advert.get("map") if isinstance(advert.get("map"), dict) else {}
 
-    title = _node_text(soup.select_one(".offer__advert-title h1")) or clean_text(advert.get("title"))
+    street = clean_text(advert.get("addressTitle"))
+    title = clean_text(advert.get("title")) or _title_from_h1(soup, street)
     price_text = _node_text(soup.select_one(".offer__price"))
     # .offer__location holds only "city, district"; the street is in the JSON payload.
     location = _node_text(soup.select_one(".offer__location span"))
     address = clean_text(summary.get("fullAddress")) or (
-        ", ".join(part for part in (location, clean_text(advert.get("addressTitle"))) if part) or None
+        ", ".join(part for part in (location, street) if part) or None
     )
     # .text also wraps the translate widget, so prefer the inner .js-description.
     description = (soup.select_one(".offer__description .js-description")
@@ -145,6 +146,14 @@ def parse_listing_page(html: str, url: str | None = None) -> dict:
         "photos": _parse_photos(soup, advert),
         "params": _parse_params(soup),
     }
+
+
+def _title_from_h1(soup: BeautifulSoup, street: str | None) -> str | None:
+    """The h1 is the card title plus ", <street>" (which may carry the seller's own text)."""
+    h1 = _node_text(soup.select_one(".offer__advert-title h1"))
+    if h1 and street and h1.endswith(f", {street}"):
+        return h1[: -len(street) - 2]
+    return h1
 
 
 def _advert_summary(data: dict, listing_id: int | None) -> dict:

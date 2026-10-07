@@ -4,7 +4,7 @@ import signal
 
 import pytest
 
-from krisha_scraper import cli
+from krisha_scraper import cli, storage
 from krisha_scraper.scraper import page_url
 
 SEARCH_URL = "https://krisha.kz/prodazha/kvartiry/almaty/"
@@ -18,7 +18,9 @@ def search_html(ids, last_page):
 
 
 class FakeClient:
-    """Serves 3 search pages; sends the process SIGTERM when page 2 is requested."""
+    """Serves 3 search pages; sends the process ``SIGNAL`` when page 2 is requested."""
+
+    SIGNAL = getattr(signal, "SIGTERM", None)
 
     def __init__(self, **kwargs):
         self.requested = []
@@ -26,7 +28,7 @@ class FakeClient:
     def get(self, url):
         self.requested.append(url)
         if url == page_url(SEARCH_URL, 2):
-            os.kill(os.getpid(), signal.SIGTERM)
+            os.kill(os.getpid(), self.SIGNAL)
         page = int(url.rsplit("page=", 1)[1]) if "page=" in url else 1
         return search_html([page * 10, page * 10 + 1], last_page=3)
 
@@ -75,3 +77,39 @@ def test_sigterm_saves_collected_rows(tmp_path, monkeypatch):
     with open(out, encoding="utf-8-sig", newline="") as file:
         assert [row["id"] for row in csv.DictReader(file)] == ["10", "11"]
     assert signal.getsignal(signal.SIGTERM) is handler_before
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGTERM"), reason="no SIGTERM on this platform")
+def test_repeated_signal_does_not_cut_the_save_short(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "KrishaClient", FakeClient)
+    original_close = storage.CsvWriter.close
+
+    def close_with_second_signal(self):
+        os.kill(os.getpid(), signal.SIGTERM)
+        original_close(self)
+
+    monkeypatch.setattr(storage.CsvWriter, "close", close_with_second_signal)
+    out = tmp_path / "out.csv"
+
+    assert cli.main([SEARCH_URL, "--delay", "0", "-o", str(out)]) == 130
+
+    with open(out, encoding="utf-8-sig", newline="") as file:
+        assert [row["id"] for row in csv.DictReader(file)] == ["10", "11"]
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGHUP"), reason="no SIGHUP on this platform")
+def test_sighup_ignored_by_nohup_stays_ignored(tmp_path, monkeypatch):
+    class HangupClient(FakeClient):
+        SIGNAL = signal.SIGHUP
+
+    monkeypatch.setattr(cli, "KrishaClient", HangupClient)
+    previous = signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    try:
+        out = tmp_path / "out.csv"
+        assert cli.main([SEARCH_URL, "--delay", "0", "-o", str(out)]) == 0
+        assert signal.getsignal(signal.SIGHUP) is signal.SIG_IGN
+    finally:
+        signal.signal(signal.SIGHUP, previous)
+
+    with open(out, encoding="utf-8-sig", newline="") as file:
+        assert [row["id"] for row in csv.DictReader(file)] == ["10", "11", "20", "21", "30", "31"]
