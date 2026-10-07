@@ -171,8 +171,10 @@ def test_resume_after_site_blocked(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "KrishaClient", BlockingClient)
     assert cli.main([SEARCH_URL, "--delay", "0", "-o", str(out)]) == 1
 
-    monkeypatch.setattr(cli, "KrishaClient", WorkingClient)
+    clients = []
+    monkeypatch.setattr(cli, "KrishaClient", lambda **kwargs: clients.append(WorkingClient()) or clients[-1])
     assert cli.main([SEARCH_URL, "--delay", "0", "--resume", "-o", str(out)]) == 0
+    assert page_url(SEARCH_URL, 1) not in clients[0].requested  # continued from page 2
 
     with open(out, encoding="utf-8-sig", newline="") as file:
         assert [row["id"] for row in csv.DictReader(file)] == ["10", "11", "20", "21", "30", "31"]

@@ -28,6 +28,11 @@ def tmp_path(path: Path) -> Path:
     return path.with_name(path.name + ".tmp")
 
 
+def progress_path(path: Path) -> Path:
+    """Where the search pages already done are kept, for --resume."""
+    return path.with_name(path.name + ".progress.json")
+
+
 def unsaved_path(path: Path) -> Path:
     """A fresh name for data that could not be saved to ``path``; no later run reuses it."""
     stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -53,24 +58,56 @@ def replace_file(path: Path, encoding: str, dump: Callable) -> None:
 
 
 class Writer:
-    def __init__(self, path: Path, existing: Iterable[dict] = ()):
+    """Also tracks how far each search got, so --resume can continue from the next page.
+
+    The progress is stored only together with the listings it covers, never ahead of them.
+    """
+
+    def __init__(self, path: Path, existing: Iterable[dict] = (), progress: dict | None = None):
         self.path = path
         self.count = 0  # records written by this run
         self.saved = False  # set once close() has stored everything
         existing = list(existing)
         self.resumed = len(existing)
         self.saved_keys = {key for key in map(record_key, existing) if key is not None}
+        self._progress = progress or {"next_page": {}, "done": []}
 
     def write(self, record: dict) -> None:
         self._write(record)
         self.count += 1
         self._after_write()
 
+    def next_page(self, search: str) -> int | None:
+        """The page to continue ``search`` from, if an earlier run got part of the way."""
+        return self._progress["next_page"].get(search)
+
+    def search_done(self, search: str) -> bool:
+        return search in self._progress["done"]
+
+    def page_done(self, search: str, page: int) -> None:
+        """Every listing of this search page has been written."""
+        self._progress["next_page"][search] = page + 1
+        self._progress_changed()
+
+    def finish_search(self, search: str) -> None:
+        self._progress["next_page"].pop(search, None)
+        if search not in self._progress["done"]:
+            self._progress["done"].append(search)
+        self._progress_changed()
+
     def _write(self, record: dict) -> None:
         raise NotImplementedError
 
     def _after_write(self) -> None:
         pass
+
+    def _progress_changed(self) -> None:
+        pass
+
+    def _save_progress(self) -> None:
+        if self._progress["next_page"] or self._progress["done"]:
+            replace_file(progress_path(self.path), "utf-8",
+                         lambda file: json.dump(self._progress, file, ensure_ascii=False, indent=2))
 
     def close(self) -> None:
         self.saved = True
@@ -85,9 +122,9 @@ class Writer:
 class JsonLinesWriter(Writer):
     """One JSON object per line, flushed immediately so nothing is lost on a crash."""
 
-    def __init__(self, path: Path, existing: Iterable[dict] = ()):
+    def __init__(self, path: Path, existing: Iterable[dict] = (), progress: dict | None = None):
         existing = list(existing)
-        super().__init__(path, existing)
+        super().__init__(path, existing, progress)
         if existing:  # rewrite without a line a killed run may have cut short, then append
             replace_file(path, "utf-8", lambda file: file.writelines(_json_line(r) for r in existing))
         self._file = open(path, "a" if existing else "w", encoding="utf-8")
@@ -109,6 +146,9 @@ class JsonLinesWriter(Writer):
         self._file.write(_json_line(record))
         self._file.flush()
 
+    def _progress_changed(self) -> None:
+        self._save_progress()
+
     def close(self) -> None:
         self._file.close()
         super().close()
@@ -123,9 +163,9 @@ class BufferedWriter(Writer):
 
     encoding = "utf-8"
 
-    def __init__(self, path: Path, existing: Iterable[dict] = ()):
+    def __init__(self, path: Path, existing: Iterable[dict] = (), progress: dict | None = None):
         existing = list(existing)
-        super().__init__(path, existing)
+        super().__init__(path, existing, progress)
         with open(path, "a", encoding=self.encoding):  # fail on a bad path before scraping
             pass
         self._records: list[dict] = [self._prepare(record) for record in existing]
@@ -169,6 +209,7 @@ class BufferedWriter(Writer):
 
     def _save(self) -> None:
         replace_file(self.path, self.encoding, self._dump)
+        self._save_progress()  # only after the listings it covers are on disk
         self._saved_at = self._clock()
 
     def _prepare(self, record: dict) -> dict:
@@ -242,6 +283,9 @@ def open_writer(path: str | Path, resume: bool = False) -> Writer:
     path.parent.mkdir(parents=True, exist_ok=True)
 
     existing: list[dict] = []
+    progress = _load_progress(path) if resume else None
+    if not resume:
+        progress_path(path).unlink(missing_ok=True)  # it described the file being replaced
     leftover = _keep_leftover_tmp(path)
     if path.is_file() and path.stat().st_size > 0:
         try:
@@ -264,7 +308,22 @@ def open_writer(path: str | Path, resume: bool = False) -> Writer:
         if len(unsaved) > len(existing):
             log.info("Продолжаю по %s: в нём больше объявлений, чем в %s", leftover.name, path.name)
             existing = unsaved
-    return writer_class(path, existing)
+    return writer_class(path, existing, progress)
+
+
+def _load_progress(path: Path) -> dict | None:
+    file = progress_path(path)
+    if not file.is_file():
+        return None
+    try:
+        with open(file, encoding="utf-8") as stream:
+            progress = json.load(stream)
+        if not (isinstance(progress.get("next_page"), dict) and isinstance(progress.get("done"), list)):
+            raise ValueError("неожиданный формат")
+    except (OSError, ValueError, AttributeError) as exc:
+        log.warning("Не удалось прочитать %s (%s): поиски начнутся с первой страницы", file.name, exc)
+        return None
+    return progress
 
 
 def _keep_leftover_tmp(path: Path) -> Path | None:

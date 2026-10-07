@@ -79,6 +79,26 @@ def test_iter_search_stops_when_page_repeats():
     assert len(client.requested) == 3
 
 
+def test_iter_search_continues_past_a_page_of_already_seen_listings():
+    # newest-first order shifts while the search is walked: page 3 repeats page 2
+    client = FakeClient({
+        page_url(SEARCH_URL, 1): search_html([1, 2], last_page=4),
+        page_url(SEARCH_URL, 2): search_html([3, 4], last_page=4),
+        page_url(SEARCH_URL, 3): search_html([3, 4], last_page=4),
+        page_url(SEARCH_URL, 4): search_html([5], last_page=4),
+    })
+    assert [card["id"] for card in iter_search(client, SEARCH_URL)] == [1, 2, 3, 4, 5]
+
+
+def test_iter_search_stops_on_a_page_without_cards():
+    client = FakeClient({
+        page_url(SEARCH_URL, 1): search_html([1, 2], last_page=1000),
+        page_url(SEARCH_URL, 2): search_html([], last_page=1000),
+    })
+    assert [card["id"] for card in iter_search(client, SEARCH_URL)] == [1, 2]
+    assert len(client.requested) == 2
+
+
 def test_iter_search_respects_max_pages_and_start_page():
     client = FakeClient({page_url(SEARCH_URL, n): search_html([n * 10], last_page=50) for n in range(1, 51)})
     cards = list(iter_search(client, SEARCH_URL, max_pages=2, start_page=4))
@@ -401,3 +421,91 @@ def test_leftover_tmp_is_kept_and_used_by_resume(tmp_path, resume):
     if resume:
         assert writer.saved_keys == {1, 2, 3}
         assert [r["id"] for r in storage.JsonLinesWriter.load(out)] == [1, 2, 3]
+
+
+class BlockOnPage(FakeClient):
+    """Serves a 3-page search; raises SiteBlocked on ``blocked`` pages."""
+
+    def __init__(self, blocked=()):
+        pages = {page_url(SEARCH_URL, n): search_html([n * 10, n * 10 + 1], last_page=3) for n in (1, 2, 3)}
+        pages.update({page_url(SEARCH_URL, n): SiteBlocked("HTTP 468") for n in blocked})
+        super().__init__(pages)
+
+
+@pytest.mark.parametrize("name", ["out.csv", "out.jsonl", "out.json"])
+def test_resume_continues_a_search_from_the_next_page(tmp_path, name):
+    out = tmp_path / name
+    with pytest.raises(SiteBlocked):
+        with open_writer(out) as writer:
+            scrape(BlockOnPage(blocked=[3]), [SEARCH_URL], writer)
+
+    client = BlockOnPage()
+    with open_writer(out, resume=True) as writer:
+        assert scrape(client, [SEARCH_URL], writer, skip=writer.saved_keys) == 2
+
+    assert client.requested == [page_url(SEARCH_URL, 3)]
+    assert [storage.record_key(r) for r in type(writer).load(out)] == [10, 11, 20, 21, 30, 31]
+
+
+def test_finished_search_is_skipped_on_resume(tmp_path):
+    out = tmp_path / "out.jsonl"
+    with open_writer(out) as writer:
+        scrape(BlockOnPage(), [SEARCH_URL], writer)
+
+    client = BlockOnPage()
+    with open_writer(out, resume=True) as writer:
+        assert scrape(client, [SEARCH_URL], writer, skip=writer.saved_keys) == 0
+    assert client.requested == []
+
+
+def test_progress_is_never_ahead_of_the_saved_listings(tmp_path):
+    out = tmp_path / "out.csv"
+    writer = open_writer(out)
+    writer._clock = clock = FakeClock()
+    writer._saved_at = 0.0
+    scrape(BlockOnPage(), [SEARCH_URL], writer, max_pages=2)
+
+    # pages 1-2 are done, but nothing is on disk yet: a killed run must not skip them
+    assert not storage.progress_path(out).exists()
+    clock.now = storage.CHECKPOINT_INTERVAL + 1
+    writer.write({"id": 99})  # triggers a checkpoint
+    progress = json.loads(storage.progress_path(out).read_text(encoding="utf-8"))
+    assert progress["next_page"] == {SEARCH_URL: 3}
+
+
+def test_new_run_without_resume_starts_searches_over(tmp_path):
+    out = tmp_path / "out.jsonl"
+    with pytest.raises(SiteBlocked):
+        with open_writer(out) as writer:
+            scrape(BlockOnPage(blocked=[2]), [SEARCH_URL], writer)
+    assert storage.progress_path(out).exists()
+
+    client = BlockOnPage()
+    with open_writer(out) as writer:
+        scrape(client, [SEARCH_URL], writer)
+    assert client.requested[0] == page_url(SEARCH_URL, 1)
+
+
+def test_unreadable_progress_starts_from_the_first_page(tmp_path, caplog):
+    out = tmp_path / "out.jsonl"
+    with open_writer(out) as writer:
+        writer.write({"id": 10})
+    storage.progress_path(out).write_text("{broken", encoding="utf-8")
+
+    client = BlockOnPage()
+    with caplog.at_level(logging.WARNING):
+        with open_writer(out, resume=True) as writer:
+            scrape(client, [SEARCH_URL], writer, skip=writer.saved_keys)
+    assert "первой страницы" in caplog.text
+    assert client.requested[0] == page_url(SEARCH_URL, 1)
+
+
+def test_pages_limit_leaves_the_search_open_for_resume(tmp_path):
+    out = tmp_path / "out.jsonl"
+    with open_writer(out) as writer:
+        scrape(BlockOnPage(), [SEARCH_URL], writer, max_pages=1)
+
+    client = BlockOnPage()
+    with open_writer(out, resume=True) as writer:
+        scrape(client, [SEARCH_URL], writer, skip=writer.saved_keys)
+    assert client.requested == [page_url(SEARCH_URL, 2), page_url(SEARCH_URL, 3)]
