@@ -17,6 +17,18 @@ log = logging.getLogger(__name__)
 PAGE_SIZE = 20  # regular cards per search page; paid "hot" cards come on top
 
 
+class StubPage(Exception):
+    """A search page without listings while the results have not ended: a maintenance or anti-bot stub."""
+
+    def __init__(self, url: str):
+        super().__init__(f"{url} пришла без объявлений — похоже на заглушку сайта "
+                         "(технические работы или проверка на робота)")
+
+
+class IncompleteRun(Exception):
+    """Some searches were left unfinished; --resume continues them."""
+
+
 def page_url(search_url: str, page: int) -> str:
     """The search URL for a given result page; filters in the query are kept."""
     parts = urlsplit(search_url)
@@ -71,13 +83,13 @@ def iter_search(
         repeated = len(result.cards) - len(new_cards)
         log.info("Страница %d%s: %d объявлений%s", page, of_pages, len(new_cards),
                  f" (ещё {repeated} уже были на прошлых страницах)" if repeated else "")
-        if not result.cards and page > start_page:
+        if not result.cards:
             # results never end with an empty page (out-of-range numbers repeat the last one),
-            # so this is a stub, e.g. maintenance: stop without marking the search finished
-            log.warning("Страница %d пришла без объявлений, хотя выдача не кончилась — возможно, заглушка "
-                        "сайта. Поиск остановлен, --resume продолжит с этого места", page)
-            return
-        if not result.cards or (not new_cards and result.last_page is None):
+            # so unless the site says nothing was found, this is a stub: the search is not finished
+            if result.total == 0:
+                break
+            raise StubPage(url)
+        if not new_cards and result.last_page is None:
             break
         yield from new_cards
         if on_page_done:
@@ -110,38 +122,46 @@ def scrape(
     """
     seen = set(skip)
     count = 0
+    unfinished = 0
     for url in sorted(urls, key=lambda u: listing_id_from_url(u) is None):
         listing_id = listing_id_from_url(url)
         search = None if listing_id else page_url(url, 1)
-        if listing_id:
-            cards: Iterable[dict] = [{"id": listing_id, "url": url}]
-        elif writer.search_done(search):
+        if search and writer.search_done(search):
             log.info("Поиск %s уже пройден", url)
             continue
-        else:
-            first_page = start_page
-            stored = writer.next_page(search)
-            if stored:
-                first_page = resume_page(client, url, stored, seen, start_page)
-                log.info("Продолжаю поиск %s со страницы %d (в прошлый раз пройдено до %d)",
-                         url, first_page, stored - 1)
-            cards = iter_search(client, url, max_pages=max_pages, start_page=first_page,
-                                on_page_done=lambda page, search=search: writer.page_done(search, page),
-                                on_finished=lambda search=search: writer.finish_search(search))
-        for card in cards:
-            if _key(card) in seen:
-                continue
-            seen.add(_key(card))
+        try:
             if listing_id:
-                record = parse_listing_page(client.get(url), url)
-            elif details:
-                record = with_details(client, card)
+                cards: Iterable[dict] = [{"id": listing_id, "url": url}]
             else:
-                record = card
-            writer.write(record)
-            count += 1
-            if limit and count >= limit:
-                return count
+                first_page = start_page
+                stored = writer.next_page(search)
+                if stored:
+                    first_page = resume_page(client, url, stored, seen, start_page)
+                    log.info("Продолжаю поиск %s со страницы %d (в прошлый раз пройдено до %d)",
+                             url, first_page, stored - 1)
+                cards = iter_search(client, url, max_pages=max_pages, start_page=first_page,
+                                    on_page_done=lambda page, search=search: writer.page_done(search, page),
+                                    on_finished=lambda search=search: writer.finish_search(search))
+            for card in cards:
+                if _key(card) in seen:
+                    continue
+                seen.add(_key(card))
+                if listing_id:
+                    record = parse_listing_page(client.get(url), url)
+                elif details:
+                    record = with_details(client, card)
+                else:
+                    record = card
+                writer.write(record)
+                count += 1
+                if limit and count >= limit:
+                    return count
+        except StubPage as exc:
+            log.warning("Поиск %s не завершён: %s", url, exc)
+            unfinished += 1
+    if unfinished:
+        raise IncompleteRun(f"не завершено поисков: {unfinished} — сайт показывал страницы без объявлений. "
+                            "Запустите ту же команду с --resume позже")
     return count
 
 
@@ -157,8 +177,17 @@ def resume_page(client: KrishaClient, search_url: str, next_page: int, saved: se
     page, step = next_page - 1, 1
     while page > first_page:
         url = page_url(search_url, page)
-        cards = parse_search_page(client.get(url), url).cards
-        if cards and 2 * sum(_key(card) in saved for card in cards) >= len(cards):
+        result = parse_search_page(client.get(url), url)
+        if not result.cards:
+            if result.total == 0:
+                return first_page
+            raise StubPage(url)
+        if result.last_page is not None and page >= result.last_page:
+            # the last page may be short (hot cards outweigh the rest) or repeat an out-of-range
+            # number: judge the full page before it instead
+            page = max(first_page, min(page, result.last_page) - 1)
+            continue
+        if 2 * sum(_key(card) in saved for card in result.cards) >= len(result.cards):
             return page
         page, step = max(first_page, page - step), step * 2
     return max(first_page, page)

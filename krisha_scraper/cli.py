@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from urllib.parse import urlsplit
 
 from .client import DEFAULT_USER_AGENT, KrishaClient, RobotsDisallowed, SiteBlocked
-from .scraper import scrape
+from .scraper import IncompleteRun, scrape
 from .storage import open_writer
 
 log = logging.getLogger("krisha_scraper")
@@ -153,7 +153,7 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         log.warning("Остановлено пользователем")
         status = 130
-    except (RobotsDisallowed, SiteBlocked, OSError) as exc:  # OSError covers network errors
+    except (RobotsDisallowed, SiteBlocked, IncompleteRun, OSError) as exc:  # OSError covers network errors
         log.error("Ошибка: %s", exc)
         status = 1
     if save_error is not None:

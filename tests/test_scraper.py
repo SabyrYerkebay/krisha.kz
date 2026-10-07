@@ -8,14 +8,14 @@ import requests
 
 from krisha_scraper import storage
 from krisha_scraper.client import RobotsDisallowed, SiteBlocked
-from krisha_scraper.scraper import iter_search, page_url, scrape
+from krisha_scraper.scraper import IncompleteRun, StubPage, iter_search, page_url, scrape
 from krisha_scraper.storage import open_writer
 
 SEARCH_URL = "https://krisha.kz/prodazha/kvartiry/almaty/"
 
 
 def search_html(ids, last_page=None, total=None):
-    subtitle = f'<div class="a-search-subtitle">Найдено <span>{total}</span> объявлений</div>' if total else ""
+    subtitle = f'<div class="a-search-subtitle">Найдено <span>{total}</span> объявлений</div>' if total is not None else ""
     cards = subtitle + "".join(
         f'<div class="a-card" data-id="{i}"><a class="a-card__title" href="/a/show/{i}">'
         f'1-комнатная квартира · 40 м² · 2/5 этаж</a><div class="a-card__price">{i} 〒</div></div>'
@@ -90,13 +90,22 @@ def test_iter_search_continues_past_a_page_of_already_seen_listings():
     assert [card["id"] for card in iter_search(client, SEARCH_URL)] == [1, 2, 3, 4, 5]
 
 
-def test_iter_search_stops_on_a_page_without_cards():
+def test_page_without_cards_is_a_stub_not_the_end():
     client = FakeClient({
         page_url(SEARCH_URL, 1): search_html([1, 2], last_page=1000),
-        page_url(SEARCH_URL, 2): search_html([], last_page=1000),
+        page_url(SEARCH_URL, 2): "<html><body>Ведутся технические работы</body></html>",
     })
-    assert [card["id"] for card in iter_search(client, SEARCH_URL)] == [1, 2]
-    assert len(client.requested) == 2
+    cards = iter_search(client, SEARCH_URL)
+    assert [next(cards)["id"], next(cards)["id"]] == [1, 2]
+    with pytest.raises(StubPage):
+        next(cards)
+
+
+def test_search_with_nothing_found_finishes():
+    finished = []
+    client = FakeClient({page_url(SEARCH_URL, 1): search_html([], total=0)})
+    assert list(iter_search(client, SEARCH_URL, on_finished=lambda: finished.append(True))) == []
+    assert finished == [True]
 
 
 def test_iter_search_respects_max_pages_and_start_page():
@@ -550,11 +559,16 @@ def test_progress_that_cannot_be_saved_does_not_stop_the_run(tmp_path, monkeypat
 
 
 class ShiftingSite:
-    """A price-sorted search of 20 listings per page whose listings can be sold between runs."""
+    """A price-sorted search of 20 listings per page whose listings can be sold between runs.
 
-    def __init__(self, ids, blocked_page=None):
+    ``hot`` listings are shown on top of every page, out of price order, like paid "hot" cards.
+    """
+
+    def __init__(self, ids, blocked_page=None, hot=()):
         self.ids = list(ids)
         self.blocked_page = blocked_page
+        self.hot = list(hot)
+        self.stub = False
         self.requested = []
 
     def get(self, url):
@@ -562,9 +576,11 @@ class ShiftingSite:
         page = int(url.rsplit("page=", 1)[1]) if "page=" in url else 1
         if page == self.blocked_page:
             raise SiteBlocked("HTTP 468")
+        if self.stub:
+            return "<html><body>Ведутся технические работы</body></html>"
         last_page = max(1, -(-len(self.ids) // 20))
         page = min(page, last_page)  # out-of-range numbers show the last page
-        return search_html(self.ids[(page - 1) * 20:page * 20], last_page=last_page)
+        return search_html(self.hot + self.ids[(page - 1) * 20:page * 20], last_page=last_page)
 
 
 @pytest.mark.parametrize("sold", [5, 25, 70])
@@ -602,9 +618,55 @@ def test_page_without_cards_mid_search_does_not_finish_it(tmp_path, caplog):
     stub = BlockOnPage()
     stub.pages[page_url(SEARCH_URL, 2)] = "<html><body>Ведутся технические работы</body></html>"
     with caplog.at_level(logging.WARNING):
-        with open_writer(out) as writer:
-            assert scrape(stub, [SEARCH_URL], writer) == 2
-    assert "заглушка" in caplog.text
+        with pytest.raises(IncompleteRun, match="--resume"):
+            with open_writer(out) as writer:
+                scrape(stub, [SEARCH_URL], writer)
+    assert "заглушк" in caplog.text
 
     with open_writer(out, resume=True) as writer:
         assert scrape(BlockOnPage(), [SEARCH_URL], writer, skip=writer.saved_keys) == 4
+
+
+@pytest.mark.parametrize("count, blocked_page, sold, hot", [
+    (590, 30, 30, 0),   # stopped near the end, the search shrank by more than a page
+    (595, 30, 32, 5),   # a short last page where saved hot cards outvote the rest
+    (640, 32, 77, 5),
+    (1200, 40, 300, 3),
+])
+def test_resume_near_the_end_of_a_shrinking_search(tmp_path, count, blocked_page, sold, hot):
+    out = tmp_path / "out.csv"
+    ids = list(range(10_000, 10_000 + count))
+    site = ShiftingSite(ids, blocked_page=blocked_page, hot=ids[100:100 + hot])
+    with pytest.raises(SiteBlocked):
+        with open_writer(out) as writer:
+            scrape(site, [SEARCH_URL], writer)
+
+    site.ids, site.blocked_page = [i for i in site.ids[sold:]], None
+    site.ids = sorted(set(site.ids) | set(site.hot))
+    with open_writer(out, resume=True) as writer:
+        scrape(site, [SEARCH_URL], writer, skip=writer.saved_keys)
+
+    saved = {storage.record_key(r) for r in storage.CsvWriter.load(out)}
+    assert set(site.ids) <= saved
+
+
+def test_stub_during_resume_leaves_every_search_open(tmp_path):
+    out = tmp_path / "out.jsonl"
+    other = SEARCH_URL + "?das[price][from]=50000000"
+    site = ShiftingSite(range(1000, 1200), blocked_page=6)
+    with pytest.raises(SiteBlocked):
+        with open_writer(out) as writer:
+            scrape(site, [SEARCH_URL, other], writer)
+
+    site.blocked_page, site.stub = None, True  # the site shows a maintenance page
+    with pytest.raises(IncompleteRun):
+        with open_writer(out, resume=True) as writer:
+            scrape(site, [SEARCH_URL, other], writer, skip=writer.saved_keys)
+
+    site.stub = False
+    with open_writer(out, resume=True) as writer:
+        scrape(site, [SEARCH_URL, other], writer, skip=writer.saved_keys)
+    saved = {r["id"] for r in storage.JsonLinesWriter.load(out)}
+    assert set(site.ids) <= saved
+    progress = json.loads(storage.progress_path(out).read_text(encoding="utf-8"))
+    assert sorted(progress["done"]) == sorted([SEARCH_URL, page_url(other, 1)])
