@@ -176,3 +176,41 @@ def test_resume_after_site_blocked(tmp_path, monkeypatch):
 
     with open(out, encoding="utf-8-sig", newline="") as file:
         assert [row["id"] for row in csv.DictReader(file)] == ["10", "11", "20", "21", "30", "31"]
+
+
+@pytest.mark.parametrize("stop, status, message", [
+    (SiteBlocked("krisha.kz ограничил доступ (HTTP 468)"), 1, "ограничил доступ"),
+    (KeyboardInterrupt(), 130, "Остановлено пользователем"),
+])
+def test_failed_save_does_not_hide_why_the_run_stopped(tmp_path, monkeypatch, caplog, stop, status, message):
+    class StoppingClient(FakeClient):
+        def get(self, url):
+            if url == page_url(SEARCH_URL, 2):
+                raise stop
+            return search_html([10, 11], last_page=3)
+
+    def locked_close(self):
+        raise OSError("Не удалось записать out.csv (файл открыт в Excel?)")
+
+    monkeypatch.setattr(cli, "KrishaClient", StoppingClient)
+    monkeypatch.setattr(storage.CsvWriter, "close", locked_close)
+
+    assert cli.main([SEARCH_URL, "--delay", "0", "-o", str(tmp_path / "out.csv")]) == status
+    assert message in caplog.text
+    assert "Ошибка сохранения" in caplog.text
+    assert "Сохранено объявлений" not in caplog.text
+
+
+def test_limit_counts_listings_already_in_the_file(tmp_path, monkeypatch):
+    class AllPagesClient(FakeClient):
+        def get(self, url):
+            page = int(url.rsplit("page=", 1)[1]) if "page=" in url else 1
+            return search_html([page * 10, page * 10 + 1], last_page=3)
+
+    monkeypatch.setattr(cli, "KrishaClient", AllPagesClient)
+    out = tmp_path / "out.csv"
+    assert cli.main([SEARCH_URL, "--delay", "0", "--limit", "2", "-o", str(out)]) == 0
+    assert cli.main([SEARCH_URL, "--delay", "0", "--limit", "3", "--resume", "-o", str(out)]) == 0
+    assert cli.main([SEARCH_URL, "--delay", "0", "--limit", "3", "--resume", "-o", str(out)]) == 0
+
+    assert [row["id"] for row in storage.CsvWriter.load(out)] == ["10", "11", "20"]

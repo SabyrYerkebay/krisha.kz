@@ -97,7 +97,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="с какой страницы начать (по умолчанию %(default)s)")
     parser.add_argument("-d", "--details", action="store_true",
                         help="открывать каждое объявление: параметры, описание, координаты, фото")
-    parser.add_argument("--limit", type=_positive_int, help="остановиться после N объявлений")
+    parser.add_argument("--limit", type=_positive_int,
+                        help="остановиться, когда в файле N объявлений (с --resume считаются и сохранённые раньше)")
     parser.add_argument("--resume", action="store_true",
                         help="продолжить сбор в тот же файл: уже сохранённые объявления остаются "
                              "и не скачиваются заново")
@@ -127,23 +128,37 @@ def main(argv: list[str] | None = None) -> int:
     if writer.resumed:
         log.info("Продолжаю: в %s уже %d объявлений, они не будут скачиваться заново", args.output, writer.resumed)
 
+    limit = args.limit
+    if limit and writer.resumed:
+        limit -= writer.resumed
+        if limit <= 0:
+            log.info("В файле уже %d объявлений: лимит --limit %d достигнут", writer.resumed, args.limit)
+
     client = KrishaClient(delay=args.delay, timeout=args.timeout, retries=args.retries,
                           user_agent=args.user_agent)
     status = 0
+    save_error = None
     try:
         with _stop_on_termination() as hold_signals:
             try:
-                scrape(client, args.urls, writer, max_pages=args.pages, start_page=args.start_page,
-                       details=args.details, limit=args.limit, skip=writer.saved_keys)
+                if limit is None or limit > 0:
+                    scrape(client, args.urls, writer, max_pages=args.pages, start_page=args.start_page,
+                           details=args.details, limit=limit, skip=writer.saved_keys)
             finally:
                 hold_signals()  # nothing may interrupt the final save
-                writer.close()
+                try:
+                    writer.close()
+                except OSError as exc:  # reported after the reason the run stopped, not instead of it
+                    save_error = exc
     except KeyboardInterrupt:
         log.warning("Остановлено пользователем")
         status = 130
-    except (RobotsDisallowed, SiteBlocked, OSError) as exc:  # OSError covers network errors and a failed save
+    except (RobotsDisallowed, SiteBlocked, OSError) as exc:  # OSError covers network errors
         log.error("Ошибка: %s", exc)
         status = 1
+    if save_error is not None:
+        log.error("Ошибка сохранения: %s", save_error)
+        status = status or 1
     if writer.saved:
         total = f" (всего в файле {writer.resumed + writer.count})" if writer.resumed else ""
         log.info("Сохранено объявлений: %d%s → %s", writer.count, total, args.output)

@@ -1,6 +1,7 @@
 import csv
 import json
 import logging
+from pathlib import Path
 
 import pytest
 import requests
@@ -350,3 +351,53 @@ def test_scrape_skips_saved_listings(tmp_path):
     with open_writer(out) as writer:
         assert scrape(client, [SEARCH_URL], writer, details=True, skip={1, 2}) == 1
     assert client.requested == [page_url(SEARCH_URL, 1), "https://krisha.kz/a/show/3"]
+
+
+def lock_main_file(monkeypatch, locked_path):
+    """Make os.replace onto ``locked_path`` fail, as on Windows when Excel has the file open."""
+    real_replace = storage.os.replace
+
+    def replace(src, dst):
+        if Path(dst) == locked_path:
+            raise PermissionError(13, "Permission denied")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(storage.os, "replace", replace)
+    monkeypatch.setattr(storage.time, "sleep", lambda seconds: None)
+
+
+def test_final_save_failure_keeps_a_copy_the_next_run_will_not_overwrite(tmp_path, monkeypatch):
+    out = tmp_path / "out.csv"
+    writer = open_writer(out)
+    writer.write({"id": 1})
+    writer.write({"id": 2})
+    lock_main_file(monkeypatch, out)
+
+    with pytest.raises(OSError, match=r"out\.unsaved-\d{8}-\d{6}\.csv") as exc:
+        writer.close()
+    rescued = next(tmp_path.glob("out.unsaved-*.csv"))
+    assert rescued.name in str(exc.value)
+    assert [row["id"] for row in storage.CsvWriter.load(rescued)] == ["1", "2"]
+
+    monkeypatch.undo()
+    with open_writer(out) as writer:  # the next run
+        writer.write({"id": 3})
+    assert [row["id"] for row in storage.CsvWriter.load(rescued)] == ["1", "2"]
+
+
+@pytest.mark.parametrize("resume", [False, True])
+def test_leftover_tmp_is_kept_and_used_by_resume(tmp_path, resume):
+    out = tmp_path / "out.jsonl"
+    with open_writer(out) as writer:
+        writer.write({"id": 1})
+    # a run killed while out.jsonl was locked left its newest data in the .tmp
+    (tmp_path / "out.jsonl.tmp").write_text('{"id": 1}\n{"id": 2}\n{"id": 3}\n', encoding="utf-8")
+
+    writer = open_writer(out, resume=resume)
+    writer.close()
+
+    rescued = list(tmp_path.glob("out.unsaved-*.jsonl"))
+    assert len(rescued) == 1 and not (tmp_path / "out.jsonl.tmp").exists()
+    if resume:
+        assert writer.saved_keys == {1, 2, 3}
+        assert [r["id"] for r in storage.JsonLinesWriter.load(out)] == [1, 2, 3]

@@ -24,12 +24,27 @@ def record_key(record: dict):
     return listing_id or record.get("url") or None
 
 
+def tmp_path(path: Path) -> Path:
+    return path.with_name(path.name + ".tmp")
+
+
+def unsaved_path(path: Path) -> Path:
+    """A fresh name for data that could not be saved to ``path``; no later run reuses it."""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    candidate = path.with_name(f"{path.stem}.unsaved-{stamp}{path.suffix}")
+    number = 2
+    while candidate.exists():
+        candidate = path.with_name(f"{path.stem}.unsaved-{stamp}-{number}{path.suffix}")
+        number += 1
+    return candidate
+
+
 def replace_file(path: Path, encoding: str, dump: Callable) -> None:
     """Write via a temporary file and swap it in, so the file on disk is always complete.
 
     If the swap fails, the complete data stays in ``<name>.tmp``.
     """
-    tmp = path.with_name(path.name + ".tmp")
+    tmp = tmp_path(path)
     with open(tmp, "w", encoding=encoding, newline="") as file:
         dump(file)
         file.flush()
@@ -126,7 +141,8 @@ class BufferedWriter(Writer):
         try:
             self._save()
         except OSError as exc:  # e.g. the CSV is open in Excel; the next checkpoint tries again
-            log.warning("Не удалось сохранить %s (%s), попробую через минуту", self.path, exc)
+            log.warning("Не удалось сохранить %s (%s), попробую через минуту; свежие данные пока в %s",
+                        self.path, exc, tmp_path(self.path).name)
             self._saved_at = self._clock()
 
     def close(self) -> None:
@@ -137,9 +153,19 @@ class BufferedWriter(Writer):
             except PermissionError as exc:
                 if attempt == SAVE_ATTEMPTS:
                     raise OSError(f"Не удалось записать {self.path} (файл открыт в Excel?): {exc}. "
-                                  f"Все данные сохранены в {self.path.name}.tmp рядом с ним") from exc
+                                  f"{self._rescue()}") from exc
                 time.sleep(1)
         super().close()
+
+    def _rescue(self) -> str:
+        """Move the complete copy left in .tmp to a name the next run will not overwrite."""
+        tmp = tmp_path(self.path)
+        try:
+            rescue = unsaved_path(self.path)
+            os.replace(tmp, rescue)
+        except OSError:
+            return f"Все данные сохранены в {tmp.name} рядом с ним — переименуйте его, пока не запустили снова"
+        return f"Все данные сохранены в {rescue.name} рядом с ним"
 
     def _save(self) -> None:
         replace_file(self.path, self.encoding, self._dump)
@@ -216,6 +242,7 @@ def open_writer(path: str | Path, resume: bool = False) -> Writer:
     path.parent.mkdir(parents=True, exist_ok=True)
 
     existing: list[dict] = []
+    leftover = _keep_leftover_tmp(path)
     if path.is_file() and path.stat().st_size > 0:
         try:
             saved = writer_class.load(path)
@@ -229,7 +256,27 @@ def open_writer(path: str | Path, resume: bool = False) -> Writer:
             backup = path.with_name(f"{path.stem}.prev{path.suffix}")
             os.replace(path, backup)
             log.warning("Файл %s уже был: старая версия перенесена в %s", path, backup.name)
+    if resume and leftover is not None:
+        try:
+            unsaved = writer_class.load(leftover)
+        except (ValueError, csv.Error):
+            unsaved = []
+        if len(unsaved) > len(existing):
+            log.info("Продолжаю по %s: в нём больше объявлений, чем в %s", leftover.name, path.name)
+            existing = unsaved
     return writer_class(path, existing)
+
+
+def _keep_leftover_tmp(path: Path) -> Path | None:
+    """A .tmp left by a run killed while the file was locked may hold its newest data: keep it."""
+    tmp = tmp_path(path)
+    if not (tmp.is_file() and tmp.stat().st_size > 0):
+        return None
+    leftover = unsaved_path(path)
+    os.replace(tmp, leftover)
+    log.warning("Найден %s от прошлого запуска (там могут быть данные новее основного файла): "
+                "переименован в %s", tmp.name, leftover.name)
+    return leftover
 
 
 def _json_line(record: dict) -> str:
