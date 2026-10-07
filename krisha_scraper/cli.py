@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 
 import requests
 
-from .client import DEFAULT_USER_AGENT, KrishaClient, RobotsDisallowed
+from .client import DEFAULT_USER_AGENT, KrishaClient, RobotsDisallowed, SiteBlocked
 from .scraper import scrape
 from .storage import open_writer
 
@@ -58,7 +58,7 @@ def _krisha_url(value: str) -> str:
 
 @contextmanager
 def _stop_on_termination():
-    """Turn SIGTERM/SIGHUP into KeyboardInterrupt so buffered CSV/JSON output still gets written.
+    """Turn SIGTERM/SIGHUP (Ctrl+Break on Windows) into KeyboardInterrupt so buffered CSV/JSON output is saved.
 
     Signals already ignored (``nohup``) stay ignored. After the first one, the rest are
     ignored too, so a repeated signal cannot cut the file short while it is being saved.
@@ -68,7 +68,7 @@ def _stop_on_termination():
             signal.signal(getattr(signal, name), signal.SIG_IGN)
         raise KeyboardInterrupt
 
-    names = [name for name in ("SIGTERM", "SIGHUP")
+    names = [name for name in ("SIGTERM", "SIGHUP", "SIGBREAK")
              if hasattr(signal, name) and signal.getsignal(getattr(signal, name)) is not signal.SIG_IGN]
     previous = {name: signal.signal(getattr(signal, name), interrupt) for name in names}
     try:
@@ -130,7 +130,7 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         log.warning("Остановлено пользователем")
         status = 130
-    except (RobotsDisallowed, requests.RequestException) as exc:
+    except (RobotsDisallowed, SiteBlocked, requests.RequestException) as exc:
         log.error("Ошибка: %s", exc)
         status = 1
     log.info("Сохранено объявлений: %d → %s", writer.count, args.output)

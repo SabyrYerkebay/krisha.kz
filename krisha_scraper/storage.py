@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import csv
 import json
+import os
+import time
 from pathlib import Path
+
+CHECKPOINT_INTERVAL = 60.0  # seconds between rewrites of a CSV/JSON file during a run
 
 
 class Writer:
@@ -44,40 +48,67 @@ class JsonLinesWriter(Writer):
         self._file.close()
 
 
-class JsonWriter(Writer):
+class BufferedWriter(Writer):
+    """Keeps every record and rewrites the whole file: on close and every CHECKPOINT_INTERVAL.
+
+    The checkpoints mean a run killed without a chance to save (a closed console
+    window on Windows, a power cut) loses at most the last interval.
+    """
+
+    encoding = "utf-8"
+
     def __init__(self, path: Path):
         super().__init__(path)
-        self._file = open(path, "w", encoding="utf-8")  # fail on a bad path before scraping
+        self._file = open(path, "w", encoding=self.encoding, newline="")  # fail on a bad path before scraping
         self._records: list[dict] = []
+        self._clock = time.monotonic
+        self._saved_at = self._clock()
 
     def _write(self, record: dict) -> None:
-        self._records.append(record)
+        self._records.append(self._prepare(record))
+        if self._clock() - self._saved_at >= CHECKPOINT_INTERVAL:
+            self._save()
 
     def close(self) -> None:
         with self._file:
-            json.dump(self._records, self._file, ensure_ascii=False, indent=2)
+            self._save()
+
+    def _save(self) -> None:
+        self._file.seek(0)
+        self._file.truncate()
+        self._dump(self._file)
+        self._file.flush()
+        os.fsync(self._file.fileno())
+        self._saved_at = self._clock()
+
+    def _prepare(self, record: dict) -> dict:
+        return record
+
+    def _dump(self, file) -> None:
+        raise NotImplementedError
 
 
-class CsvWriter(Writer):
-    """Buffers rows so the header includes every listing parameter seen.
+class JsonWriter(BufferedWriter):
+    def _dump(self, file) -> None:
+        json.dump(self._records, file, ensure_ascii=False, indent=2)
+
+
+class CsvWriter(BufferedWriter):
+    """The header includes every listing parameter seen, so rows are kept until the file is written.
 
     Written with a BOM (utf-8-sig) so Excel shows Cyrillic correctly.
     """
 
-    def __init__(self, path: Path):
-        super().__init__(path)
-        self._file = open(path, "w", encoding="utf-8-sig", newline="")  # fail on a bad path before scraping
-        self._rows: list[dict] = []
+    encoding = "utf-8-sig"
 
-    def _write(self, record: dict) -> None:
-        self._rows.append(flatten(record))
+    def _prepare(self, record: dict) -> dict:
+        return flatten(record)
 
-    def close(self) -> None:
-        columns = list(dict.fromkeys(key for row in self._rows for key in row))
-        with self._file:
-            writer = csv.DictWriter(self._file, fieldnames=columns)
-            writer.writeheader()
-            writer.writerows(self._rows)
+    def _dump(self, file) -> None:
+        columns = list(dict.fromkeys(key for row in self._records for key in row))
+        writer = csv.DictWriter(file, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(self._records)
 
 
 def flatten(record: dict) -> dict:

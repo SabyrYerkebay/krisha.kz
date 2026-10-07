@@ -14,6 +14,8 @@ from .storage import Writer
 
 log = logging.getLogger(__name__)
 
+PAGE_SIZE = 20  # regular cards per search page; paid "hot" cards come on top
+
 
 def page_url(search_url: str, page: int) -> str:
     """The search URL for a given result page; filters in the query are kept."""
@@ -43,6 +45,13 @@ def iter_search(
         result = parse_search_page(client.get(url), url)
         if page == start_page and result.total is not None:
             log.info("Найдено объявлений: %d", result.total)
+            if result.last_page and result.total > result.last_page * PAGE_SIZE:
+                # krisha.kz stops paging at 1000 pages, so the rest of a big search is unreachable
+                log.warning(
+                    "Сайт показывает только %d страниц (около %d объявлений) из %d. "
+                    "Чтобы получить все, разбейте поиск фильтрами: цена, район, комнаты",
+                    result.last_page, result.last_page * PAGE_SIZE, result.total,
+                )
         if result.last_page is not None and page > result.last_page:
             log.info("Страница %d за пределами выдачи: всего страниц %d", page, result.last_page)
             break

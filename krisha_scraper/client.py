@@ -19,12 +19,18 @@ DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/129.0 Safari/537.36"
 )
-RETRY_STATUSES = {429, 500, 502, 503, 504}
+# 468 is krisha.kz's own "too many requests"; it clears up after a minute or so.
+THROTTLE_STATUSES = {429, 468}
+RETRY_STATUSES = THROTTLE_STATUSES | {500, 502, 503, 504}
 MAX_RETRY_AFTER = 120
 
 
 class RobotsDisallowed(Exception):
     """robots.txt of the site forbids fetching the URL."""
+
+
+class SiteBlocked(Exception):
+    """The site keeps rate-limiting us (HTTP 429/468) after every retry."""
 
 
 class KrishaClient:
@@ -54,6 +60,7 @@ class KrishaClient:
         if not self.allowed(url):
             raise RobotsDisallowed(f"robots.txt запрещает загрузку {url}")
         response = self._fetch(url)
+        self._check_blocked(response, url)
         response.raise_for_status()
         return response.text
 
@@ -65,7 +72,9 @@ class KrishaClient:
         return self._robots[origin].can_fetch(url)
 
     def _load_robots(self, origin: str) -> RobotsRules:
-        response = self._fetch(f"{origin}/robots.txt")  # a network error means the site is down anyway
+        robots_url = f"{origin}/robots.txt"
+        response = self._fetch(robots_url)  # a network error means the site is down anyway
+        self._check_blocked(response, robots_url)
         if response.status_code >= 500:
             log.warning("robots.txt ответил HTTP %s, загрузка страниц запрещена", response.status_code)
             return RobotsRules(disallow_all=True)
@@ -88,7 +97,8 @@ class KrishaClient:
                     if "charset" not in response.headers.get("Content-Type", "").lower():
                         response.encoding = "utf-8"  # requests would fall back to ISO-8859-1
                     return response
-                wait = self._retry_after(response) or self._backoff(attempt)
+                throttled = response.status_code in THROTTLE_STATUSES
+                wait = self._retry_after(response) or self._backoff(attempt, throttled)
                 reason = f"HTTP {response.status_code}"
             attempt += 1
             log.warning("%s: %s, повтор %d/%d через %.0f с", url, reason, attempt, self.retries, wait)
@@ -102,7 +112,18 @@ class KrishaClient:
         self._last_request = self._clock()
 
     @staticmethod
-    def _backoff(attempt: int) -> float:
+    def _check_blocked(response: requests.Response, url: str) -> None:
+        if response.status_code in THROTTLE_STATUSES:
+            raise SiteBlocked(
+                f"krisha.kz ограничил доступ (HTTP {response.status_code}) для {url}. "
+                "Подождите и запустите снова, лучше с большим --delay"
+            )
+
+    @staticmethod
+    def _backoff(attempt: int, throttled: bool = False) -> float:
+        """2, 4, 8 s for server errors; 30, 60, 120 s when the site asks us to slow down."""
+        if throttled:
+            return min(120.0, 30.0 * 2 ** attempt)
         return min(60.0, 2.0 ** (attempt + 1))
 
     @staticmethod

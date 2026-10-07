@@ -1,18 +1,21 @@
 import csv
 import json
+import logging
 
 import pytest
 import requests
 
-from krisha_scraper.client import RobotsDisallowed
+from krisha_scraper import storage
+from krisha_scraper.client import RobotsDisallowed, SiteBlocked
 from krisha_scraper.scraper import iter_search, page_url, scrape
 from krisha_scraper.storage import open_writer
 
 SEARCH_URL = "https://krisha.kz/prodazha/kvartiry/almaty/"
 
 
-def search_html(ids, last_page=None):
-    cards = "".join(
+def search_html(ids, last_page=None, total=None):
+    subtitle = f'<div class="a-search-subtitle">Найдено <span>{total}</span> объявлений</div>' if total else ""
+    cards = subtitle + "".join(
         f'<div class="a-card" data-id="{i}"><a class="a-card__title" href="/a/show/{i}">'
         f'1-комнатная квартира · 40 м² · 2/5 этаж</a><div class="a-card__price">{i} 〒</div></div>'
         for i in ids
@@ -130,6 +133,29 @@ def test_scrape_with_details_and_limit(tmp_path):
     assert "https://krisha.kz/a/show/3" not in client.requested
 
 
+def test_site_blocked_during_details_stops_the_run(tmp_path):
+    client = FakeClient({
+        page_url(SEARCH_URL, 1): search_html([1, 2, 3], last_page=1),
+        "https://krisha.kz/a/show/1": listing_html(1),
+        "https://krisha.kz/a/show/2": SiteBlocked("HTTP 468"),
+    })
+    out = tmp_path / "out.jsonl"
+    with pytest.raises(SiteBlocked):
+        with open_writer(out) as writer:
+            scrape(client, [SEARCH_URL], writer, details=True)
+
+    assert [json.loads(line)["id"] for line in out.read_text(encoding="utf-8").splitlines()] == [1]
+    assert "https://krisha.kz/a/show/3" not in client.requested  # no point hammering a blocking site
+
+
+@pytest.mark.parametrize("total, last_page, warned", [(42_287, 1000, True), (8_406, 421, False)])
+def test_warns_when_search_is_larger_than_the_site_pages_through(total, last_page, warned, caplog):
+    client = FakeClient({page_url(SEARCH_URL, 1): search_html([1], last_page=last_page, total=total)})
+    with caplog.at_level(logging.WARNING):
+        list(iter_search(client, SEARCH_URL, max_pages=1))
+    assert ("разбейте поиск" in caplog.text) is warned
+
+
 def test_scrape_single_listing_url(tmp_path):
     url = "https://krisha.kz/a/show/5"
     client = FakeClient({url: listing_html(5)})
@@ -165,3 +191,46 @@ def test_open_writer_fails_on_bad_path_before_scraping(tmp_path, name):
     (tmp_path / name).mkdir()
     with pytest.raises(OSError):
         open_writer(tmp_path / name)
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+
+@pytest.mark.parametrize("name", ["out.csv", "out.json"])
+def test_buffered_writers_checkpoint_to_disk(tmp_path, name):
+    out = tmp_path / name
+    writer = open_writer(out)
+    writer._clock = clock = FakeClock()
+    writer._saved_at = 0.0
+
+    writer.write({"id": 1, "params": {"Тип дома": "кирпичный"}})
+    assert out.read_bytes() == b""  # nothing written before the first interval
+    clock.now = storage.CHECKPOINT_INTERVAL + 1
+    writer.write({"id": 2})
+    clock.now += 1
+    writer.write({"id": 3})  # buffered until the next checkpoint
+
+    # what a killed process would leave behind: the first two records, as a valid file
+    raw = out.read_bytes()
+    if name.endswith(".csv"):
+        assert raw.count(b"\xef\xbb\xbf") == 1 and raw.startswith(b"\xef\xbb\xbf")
+        with open(out, encoding="utf-8-sig", newline="") as file:
+            assert [row["id"] for row in csv.DictReader(file)] == ["1", "2"]
+    else:
+        assert [r["id"] for r in json.loads(raw.decode("utf-8"))] == [1, 2]
+
+    writer.close()
+    raw = out.read_bytes()
+    if name.endswith(".csv"):
+        assert raw.count(b"\xef\xbb\xbf") == 1
+        with open(out, encoding="utf-8-sig", newline="") as file:
+            rows = list(csv.DictReader(file))
+        assert [row["id"] for row in rows] == ["1", "2", "3"]
+        assert rows[0]["Тип дома"] == "кирпичный"
+    else:
+        assert [r["id"] for r in json.loads(raw.decode("utf-8"))] == [1, 2, 3]

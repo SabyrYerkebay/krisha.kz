@@ -1,10 +1,10 @@
 import csv
-import os
 import signal
 
 import pytest
 
 from krisha_scraper import cli, storage
+from krisha_scraper.client import SiteBlocked
 from krisha_scraper.scraper import page_url
 
 SEARCH_URL = "https://krisha.kz/prodazha/kvartiry/almaty/"
@@ -28,7 +28,7 @@ class FakeClient:
     def get(self, url):
         self.requested.append(url)
         if url == page_url(SEARCH_URL, 2):
-            os.kill(os.getpid(), self.SIGNAL)
+            signal.raise_signal(self.SIGNAL)
         page = int(url.rsplit("page=", 1)[1]) if "page=" in url else 1
         return search_html([page * 10, page * 10 + 1], last_page=3)
 
@@ -85,7 +85,7 @@ def test_repeated_signal_does_not_cut_the_save_short(tmp_path, monkeypatch):
     original_close = storage.CsvWriter.close
 
     def close_with_second_signal(self):
-        os.kill(os.getpid(), signal.SIGTERM)
+        signal.raise_signal(signal.SIGTERM)
         original_close(self)
 
     monkeypatch.setattr(storage.CsvWriter, "close", close_with_second_signal)
@@ -113,3 +113,19 @@ def test_sighup_ignored_by_nohup_stays_ignored(tmp_path, monkeypatch):
 
     with open(out, encoding="utf-8-sig", newline="") as file:
         assert [row["id"] for row in csv.DictReader(file)] == ["10", "11", "20", "21", "30", "31"]
+
+
+def test_site_blocked_saves_collected_rows(tmp_path, monkeypatch):
+    class BlockingClient(FakeClient):
+        def get(self, url):
+            if url == page_url(SEARCH_URL, 2):
+                raise SiteBlocked("krisha.kz ограничил доступ (HTTP 468)")
+            return search_html([10, 11], last_page=3)
+
+    monkeypatch.setattr(cli, "KrishaClient", BlockingClient)
+    out = tmp_path / "out.csv"
+
+    assert cli.main([SEARCH_URL, "--delay", "0", "-o", str(out)]) == 1
+
+    with open(out, encoding="utf-8-sig", newline="") as file:
+        assert [row["id"] for row in csv.DictReader(file)] == ["10", "11"]

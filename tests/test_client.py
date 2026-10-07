@@ -4,7 +4,7 @@ from email.utils import format_datetime
 import pytest
 import requests
 
-from krisha_scraper.client import KrishaClient, RobotsDisallowed
+from krisha_scraper.client import KrishaClient, RobotsDisallowed, SiteBlocked
 from krisha_scraper.robots import RobotsRules
 
 ROBOTS = """
@@ -139,7 +139,33 @@ def test_unusable_retry_after_falls_back_to_backoff(value):
         "https://krisha.kz/a/show/1": [FakeResponse(429, headers={"Retry-After": value}), FakeResponse(text="ok")],
     })
     assert client.get("https://krisha.kz/a/show/1") == "ok"
-    assert client.sleeps == [2.0]
+    assert client.sleeps == [30.0]
+
+
+def test_retries_krisha_468_with_long_pauses():
+    client = make_client({
+        "https://krisha.kz/robots.txt": [FakeResponse(text="")],
+        "https://krisha.kz/a/show/1": [FakeResponse(468), FakeResponse(468), FakeResponse(text="ok")],
+    })
+    assert client.get("https://krisha.kz/a/show/1") == "ok"
+    assert client.sleeps == [30.0, 60.0]
+
+
+def test_persistent_rate_limit_raises_site_blocked():
+    client = make_client({
+        "https://krisha.kz/robots.txt": [FakeResponse(text="")],
+        "https://krisha.kz/a/show/1": [FakeResponse(468)] * 4,
+    })
+    with pytest.raises(SiteBlocked):
+        client.get("https://krisha.kz/a/show/1")
+    assert client.sleeps == [30.0, 60.0, 120.0]
+
+
+def test_rate_limited_robots_raises_site_blocked():
+    # not cached as "no robots.txt, everything allowed"
+    client = make_client({"https://krisha.kz/robots.txt": [FakeResponse(468)] * 2}, retries=1)
+    with pytest.raises(SiteBlocked):
+        client.get("https://krisha.kz/a/show/1")
 
 
 def test_gives_up_after_retries():
