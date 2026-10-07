@@ -444,7 +444,9 @@ def test_resume_continues_a_search_from_the_next_page(tmp_path, name):
     with open_writer(out, resume=True) as writer:
         assert scrape(client, [SEARCH_URL], writer, skip=writer.saved_keys) == 2
 
-    assert client.requested == [page_url(SEARCH_URL, 3)]
+    # page 2, the last one done, is checked again in case listings moved up meanwhile
+    assert page_url(SEARCH_URL, 1) not in client.requested
+    assert client.requested[-1] == page_url(SEARCH_URL, 3)
     assert [storage.record_key(r) for r in type(writer).load(out)] == [10, 11, 20, 21, 30, 31]
 
 
@@ -508,8 +510,8 @@ def test_pages_limit_leaves_the_search_open_for_resume(tmp_path):
 
     client = BlockOnPage()
     with open_writer(out, resume=True) as writer:
-        scrape(client, [SEARCH_URL], writer, skip=writer.saved_keys)
-    assert client.requested == [page_url(SEARCH_URL, 2), page_url(SEARCH_URL, 3)]
+        assert scrape(client, [SEARCH_URL], writer, skip=writer.saved_keys) == 4
+    assert client.requested[-1] == page_url(SEARCH_URL, 3)
 
 
 def test_briefly_locked_file_is_replaced_after_a_retry(tmp_path, monkeypatch):
@@ -545,3 +547,64 @@ def test_progress_that_cannot_be_saved_does_not_stop_the_run(tmp_path, monkeypat
             assert scrape(BlockOnPage(), [SEARCH_URL], writer) == 6
     assert "несколько страниц раньше" in caplog.text
     assert [r["id"] for r in storage.JsonLinesWriter.load(out)] == [10, 11, 20, 21, 30, 31]
+
+
+class ShiftingSite:
+    """A price-sorted search of 20 listings per page whose listings can be sold between runs."""
+
+    def __init__(self, ids, blocked_page=None):
+        self.ids = list(ids)
+        self.blocked_page = blocked_page
+        self.requested = []
+
+    def get(self, url):
+        self.requested.append(url)
+        page = int(url.rsplit("page=", 1)[1]) if "page=" in url else 1
+        if page == self.blocked_page:
+            raise SiteBlocked("HTTP 468")
+        last_page = max(1, -(-len(self.ids) // 20))
+        page = min(page, last_page)  # out-of-range numbers show the last page
+        return search_html(self.ids[(page - 1) * 20:page * 20], last_page=last_page)
+
+
+@pytest.mark.parametrize("sold", [5, 25, 70])
+def test_resume_finds_listings_that_moved_to_pages_already_done(tmp_path, sold):
+    out = tmp_path / "out.jsonl"
+    site = ShiftingSite(range(1000, 1200), blocked_page=6)
+    with pytest.raises(SiteBlocked):
+        with open_writer(out) as writer:
+            scrape(site, [SEARCH_URL], writer)
+
+    # while the run is stopped, the cheapest listings (already saved) are sold
+    site.ids, site.blocked_page = site.ids[sold:], None
+    with open_writer(out, resume=True) as writer:
+        scrape(site, [SEARCH_URL], writer, skip=writer.saved_keys)
+
+    saved = {r["id"] for r in storage.JsonLinesWriter.load(out)}
+    assert set(site.ids) <= saved
+
+
+def test_progress_is_ignored_when_the_data_file_no_longer_matches(tmp_path, caplog):
+    out = tmp_path / "out.csv"
+    with open_writer(out) as writer:
+        scrape(BlockOnPage(), [SEARCH_URL], writer)
+    out.unlink()  # e.g. the user archived the CSV to start over, keeping --resume in the command
+
+    client = BlockOnPage()
+    with caplog.at_level(logging.WARNING):
+        with open_writer(out, resume=True) as writer:
+            assert scrape(client, [SEARCH_URL], writer, skip=writer.saved_keys) == 6
+    assert "меньше объявлений" in caplog.text
+
+
+def test_page_without_cards_mid_search_does_not_finish_it(tmp_path, caplog):
+    out = tmp_path / "out.jsonl"
+    stub = BlockOnPage()
+    stub.pages[page_url(SEARCH_URL, 2)] = "<html><body>Ведутся технические работы</body></html>"
+    with caplog.at_level(logging.WARNING):
+        with open_writer(out) as writer:
+            assert scrape(stub, [SEARCH_URL], writer) == 2
+    assert "заглушка" in caplog.text
+
+    with open_writer(out, resume=True) as writer:
+        assert scrape(BlockOnPage(), [SEARCH_URL], writer, skip=writer.saved_keys) == 4

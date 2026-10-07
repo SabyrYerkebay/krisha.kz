@@ -71,6 +71,12 @@ def iter_search(
         repeated = len(result.cards) - len(new_cards)
         log.info("Страница %d%s: %d объявлений%s", page, of_pages, len(new_cards),
                  f" (ещё {repeated} уже были на прошлых страницах)" if repeated else "")
+        if not result.cards and page > start_page:
+            # results never end with an empty page (out-of-range numbers repeat the last one),
+            # so this is a stub, e.g. maintenance: stop without marking the search finished
+            log.warning("Страница %d пришла без объявлений, хотя выдача не кончилась — возможно, заглушка "
+                        "сайта. Поиск остановлен, --resume продолжит с этого места", page)
+            return
         if not result.cards or (not new_cards and result.last_page is None):
             break
         yield from new_cards
@@ -113,9 +119,12 @@ def scrape(
             log.info("Поиск %s уже пройден", url)
             continue
         else:
-            first_page = writer.next_page(search) or start_page
-            if first_page != start_page:
-                log.info("Продолжаю поиск %s со страницы %d", url, first_page)
+            first_page = start_page
+            stored = writer.next_page(search)
+            if stored:
+                first_page = resume_page(client, url, stored, seen, start_page)
+                log.info("Продолжаю поиск %s со страницы %d (в прошлый раз пройдено до %d)",
+                         url, first_page, stored - 1)
             cards = iter_search(client, url, max_pages=max_pages, start_page=first_page,
                                 on_page_done=lambda page, search=search: writer.page_done(search, page),
                                 on_finished=lambda search=search: writer.finish_search(search))
@@ -134,6 +143,25 @@ def scrape(
             if limit and count >= limit:
                 return count
     return count
+
+
+def resume_page(client: KrishaClient, search_url: str, next_page: int, saved: set, first_page: int = 1) -> int:
+    """Where a resumed search starts so that no listing is skipped.
+
+    While a run is stopped, listings already saved are sold and the rest move up
+    into pages that were done. Step back from the last page done, twice as far
+    each time, to a page made mostly of listings already saved: every listing not
+    saved yet comes after it. Paid "hot" cards are not in price order, hence
+    "mostly" rather than "the first card".
+    """
+    page, step = next_page - 1, 1
+    while page > first_page:
+        url = page_url(search_url, page)
+        cards = parse_search_page(client.get(url), url).cards
+        if cards and 2 * sum(_key(card) in saved for card in cards) >= len(cards):
+            return page
+        page, step = max(first_page, page - step), step * 2
+    return max(first_page, page)
 
 
 def with_details(client: KrishaClient, card: dict) -> dict:

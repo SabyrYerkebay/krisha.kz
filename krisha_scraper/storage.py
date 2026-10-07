@@ -116,6 +116,7 @@ class Writer:
         """Best effort: an older progress file only makes --resume repeat a few pages."""
         if not (self._progress["next_page"] or self._progress["done"]):
             return
+        self._progress["records"] = self.resumed + self.count  # lets --resume check the file still matches
         try:
             replace_file(progress_path(self.path), "utf-8",
                          lambda file: json.dump(self._progress, file, ensure_ascii=False, indent=2))
@@ -161,6 +162,7 @@ class JsonLinesWriter(Writer):
         self._file.flush()
 
     def _progress_changed(self) -> None:
+        os.fsync(self._file.fileno())  # the listings reach the disk before the progress that covers them
         self._save_progress()
 
     def close(self) -> None:
@@ -322,6 +324,11 @@ def open_writer(path: str | Path, resume: bool = False) -> Writer:
         if len(unsaved) > len(existing):
             log.info("Продолжаю по %s: в нём больше объявлений, чем в %s", leftover.name, path.name)
             existing = unsaved
+    if progress and len(existing) < progress.get("records", 0):
+        log.warning("В %s меньше объявлений (%d), чем было сохранено (%d): файл заменили или удалили? "
+                    "Поиски пройдут заново, уже сохранённые объявления скачиваться не будут",
+                    path.name, len(existing), progress["records"])
+        progress = None
     return writer_class(path, existing, progress)
 
 
@@ -332,7 +339,8 @@ def _load_progress(path: Path) -> dict | None:
     try:
         with open(file, encoding="utf-8") as stream:
             progress = json.load(stream)
-        if not (isinstance(progress.get("next_page"), dict) and isinstance(progress.get("done"), list)):
+        if not (isinstance(progress.get("next_page"), dict) and isinstance(progress.get("done"), list)
+                and isinstance(progress.get("records", 0), int)):
             raise ValueError("неожиданный формат")
     except (OSError, ValueError, AttributeError) as exc:
         log.warning("Не удалось прочитать %s (%s): поиски начнутся с первой страницы", file.name, exc)
