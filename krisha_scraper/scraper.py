@@ -9,12 +9,13 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import requests
 
 from .client import KrishaClient, RobotsDisallowed
-from .parsers import listing_id_from_url, parse_listing_page, parse_search_page
+from .parsers import SearchPage, listing_id_from_url, parse_listing_page, parse_search_page
 from .storage import Writer
 
 log = logging.getLogger(__name__)
 
 PAGE_SIZE = 20  # regular cards per search page; paid "hot" cards come on top
+PRICE_FROM = "das[price][from]"
 
 
 class StubPage(Exception):
@@ -44,7 +45,7 @@ def iter_search(
     max_pages: int | None = None,
     start_page: int = 1,
     on_page_done: Callable[[int], None] | None = None,
-    on_finished: Callable[[], None] | None = None,
+    on_finished: Callable[[SearchPage, int | None], None] | None = None,
 ) -> Iterator[dict]:
     """Listing cards from consecutive result pages, without duplicates.
 
@@ -54,23 +55,30 @@ def iter_search(
     bumped by their sellers push the rest down while the search is walked.
     Without a paginator such a page is the end (krisha.kz repeats the last
     page for out-of-range numbers). ``on_page_done(page)`` is called once
-    every card of that page has been taken, and ``on_finished()`` when the
-    results end (not when ``max_pages`` cuts the walk short).
+    every card of that page has been taken, and ``on_finished(last_page,
+    total)`` when the results end (not when ``max_pages`` cuts the walk short).
     """
     seen = set()
     page = start_page
+    total = None
     while max_pages is None or page < start_page + max_pages:
         url = page_url(search_url, page)
         result = parse_search_page(client.get(url), url)
+        if result.total is not None:
+            total = result.total
         if page == start_page and result.total is not None:
             log.info("Найдено объявлений: %d", result.total)
             if result.last_page and result.total > result.last_page * PAGE_SIZE:
-                # krisha.kz stops paging at 1000 pages, so the rest of a big search is unreachable
-                log.warning(
-                    "Сайт показывает только %d страниц (около %d объявлений) из %d. "
-                    "Чтобы получить все, разбейте поиск фильтрами: цена, район, комнаты",
-                    result.last_page, result.last_page * PAGE_SIZE, result.total,
-                )
+                if _sorted_by_price(search_url):
+                    log.info("Сайт показывает только %d страниц из %d объявлений: дальше продолжу поиск "
+                             "по цене, начиная с цены последних объявлений", result.last_page, result.total)
+                else:
+                    # krisha.kz stops paging at 1000 pages, so the rest of a big search is unreachable
+                    log.warning(
+                        "Сайт показывает только %d страниц (около %d объявлений) из %d. Чтобы собрать все, "
+                        "добавьте к ссылке sort_by=price-asc — парсер сам пройдёт выдачу по частям",
+                        result.last_page, result.last_page * PAGE_SIZE, result.total,
+                    )
         if result.last_page is not None and page > result.last_page:
             log.info("Страница %d за пределами выдачи: всего страниц %d", page, result.last_page)
             break
@@ -100,7 +108,32 @@ def iter_search(
     else:
         return  # stopped by max_pages: the search itself is not finished
     if on_finished:
-        on_finished()
+        on_finished(result, total)
+
+
+def next_price_range(search_url: str, last_page: SearchPage, total: int | None) -> str | None:
+    """The rest of a price-sorted search the page limit cut off: the same search from the last page's prices.
+
+    Starts a little below the middle price of the last page (paid "hot" cards are
+    not in price order), so the ranges overlap by part of a page and no listing is
+    skipped; the repeated ones are not saved twice.
+    """
+    if not (_sorted_by_price(search_url) and last_page.last_page and total
+            and total > last_page.last_page * PAGE_SIZE):
+        return None
+    prices = sorted(card["price"] for card in last_page.cards if card.get("price"))
+    if not prices:
+        return None
+    query = parse_qsl(urlsplit(search_url).query, keep_blank_values=True)
+    low = max((int(v) for k, v in query if k == PRICE_FROM and v.isdigit()), default=0)
+    price = max(low + 1, prices[len(prices) // 2] - 1)
+    parts = urlsplit(search_url)
+    query = [(k, v) for k, v in query if k not in (PRICE_FROM, "page")] + [(PRICE_FROM, str(price))]
+    return urlunsplit(parts._replace(query=urlencode(query)))
+
+
+def _sorted_by_price(search_url: str) -> bool:
+    return ("sort_by", "price-asc") in parse_qsl(urlsplit(search_url).query)
 
 
 def scrape(
@@ -124,41 +157,54 @@ def scrape(
     count = 0
     unfinished = 0
     for url in sorted(urls, key=lambda u: listing_id_from_url(u) is None):
-        listing_id = listing_id_from_url(url)
-        search = None if listing_id else page_url(url, 1)
-        if search and writer.search_done(search):
-            log.info("Поиск %s уже пройден", url)
-            continue
-        try:
-            if listing_id:
-                cards: Iterable[dict] = [{"id": listing_id, "url": url}]
-            else:
-                first_page = start_page
-                stored = writer.next_page(search)
-                if stored:
-                    first_page = resume_page(client, url, stored, seen, start_page)
-                    log.info("Продолжаю поиск %s со страницы %d (в прошлый раз пройдено до %d)",
-                             url, first_page, stored - 1)
-                cards = iter_search(client, url, max_pages=max_pages, start_page=first_page,
-                                    on_page_done=lambda page, search=search: writer.page_done(search, page),
-                                    on_finished=lambda search=search: writer.finish_search(search))
-            for card in cards:
-                if _key(card) in seen:
-                    continue
-                seen.add(_key(card))
+        while url:  # a price-sorted search beyond the page limit goes on as the next price range
+            listing_id = listing_id_from_url(url)
+            search = None if listing_id else page_url(url, 1)
+            if search and writer.search_done(search):
+                next_url = writer.continuation(search)
+                if not next_url:
+                    log.info("Поиск %s уже пройден", url)
+                url = next_url
+                continue
+            finished = []
+            try:
                 if listing_id:
-                    record = parse_listing_page(client.get(url), url)
-                elif details:
-                    record = with_details(client, card)
+                    cards: Iterable[dict] = [{"id": listing_id, "url": url}]
                 else:
-                    record = card
-                writer.write(record)
-                count += 1
-                if limit and count >= limit:
-                    return count
-        except StubPage as exc:
-            log.warning("Поиск %s не завершён: %s", url, exc)
-            unfinished += 1
+                    first_page = start_page
+                    stored = writer.next_page(search)
+                    if stored:
+                        first_page = resume_page(client, url, stored, seen, start_page)
+                        log.info("Продолжаю поиск %s со страницы %d (в прошлый раз пройдено до %d)",
+                                 url, first_page, stored - 1)
+                    cards = iter_search(client, url, max_pages=max_pages, start_page=first_page,
+                                        on_page_done=lambda page, search=search: writer.page_done(search, page),
+                                        on_finished=lambda result, total: finished.append((result, total)))
+                for card in cards:
+                    if _key(card) in seen:
+                        continue
+                    seen.add(_key(card))
+                    if listing_id:
+                        record = parse_listing_page(client.get(url), url)
+                    elif details:
+                        record = with_details(client, card)
+                    else:
+                        record = card
+                    writer.write(record)
+                    count += 1
+                    if limit and count >= limit:
+                        return count
+            except StubPage as exc:
+                log.warning("Поиск %s не завершён: %s", url, exc)
+                unfinished += 1
+                break
+            next_url = None
+            if finished:  # the results ended (not cut short by --pages)
+                next_url = next_price_range(url, *finished[0])
+                writer.finish_search(search, continue_with=next_url)
+                if next_url:
+                    log.info("Продолжаю поиск по цене: %s", next_url)
+            url = next_url
     if unfinished:
         raise IncompleteRun(f"не завершено поисков: {unfinished} — сайт показывал страницы без объявлений. "
                             "Запустите ту же команду с --resume позже")

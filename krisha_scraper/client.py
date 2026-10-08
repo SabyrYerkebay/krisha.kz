@@ -19,10 +19,15 @@ DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/129.0 Safari/537.36"
 )
-# 468 is krisha.kz's own "too many requests"; it clears up after a minute or so.
+# 468 is krisha.kz's own "too many requests". It hits listing pages (/a/show/) first, after
+# a few hundred requests in ten minutes, and can last half an hour or more.
 THROTTLE_STATUSES = {429, 468}
 RETRY_STATUSES = THROTTLE_STATUSES | {500, 502, 503, 504}
 MAX_RETRY_AFTER = 120
+BLOCK_WAITS = (30, 60, 120, 300, 600, 900, 1200, 1800)  # seconds; the last one repeats
+DEFAULT_BLOCK_WAIT = 2 * 3600  # give up on a rate limit that lasts longer than this
+MAX_DELAY = 20.0  # the pause between requests grows up to this after rate limits
+SPEED_UP_AFTER = 300  # requests without a rate limit before the pause is shortened again
 
 
 class RobotsDisallowed(Exception):
@@ -30,7 +35,7 @@ class RobotsDisallowed(Exception):
 
 
 class SiteBlocked(Exception):
-    """The site keeps rate-limiting us (HTTP 429/468) after every retry."""
+    """The site kept rate-limiting us (HTTP 429/468) for longer than we wait."""
 
 
 class KrishaClient:
@@ -41,8 +46,11 @@ class KrishaClient:
         retries: int = 3,
         user_agent: str = DEFAULT_USER_AGENT,
         session: requests.Session | None = None,
+        block_wait: float = DEFAULT_BLOCK_WAIT,
     ):
         self.delay = delay
+        self.base_delay = delay
+        self.block_wait = block_wait
         self.timeout = timeout
         self.retries = retries
         self.user_agent = user_agent
@@ -53,6 +61,7 @@ class KrishaClient:
         })
         self._robots: dict[str, RobotsRules] = {}
         self._last_request = 0.0
+        self._calm_requests = 0
         self._sleep = time.sleep
         self._clock = time.monotonic
 
@@ -83,7 +92,10 @@ class KrishaClient:
         return RobotsRules.parse(response.text, self.user_agent)
 
     def _fetch(self, url: str) -> requests.Response:
-        attempt = 0
+        """GET with retries; returns the last answer when the site is still rate-limiting us."""
+        attempt = 0  # server and network errors
+        blocks = 0  # rate-limit answers in a row
+        waited = 0.0  # time spent waiting for a rate limit to end
         while True:
             self._throttle()
             try:
@@ -91,20 +103,56 @@ class KrishaClient:
             except requests.RequestException as exc:
                 if attempt >= self.retries:
                     raise
-                wait, reason = self._backoff(attempt), str(exc)
+                wait = self._backoff(attempt)
+                attempt += 1
+                log.warning("%s: %s, повтор %d/%d через %.0f с", url, exc, attempt, self.retries, wait)
             else:
-                if response.status_code not in RETRY_STATUSES or attempt >= self.retries:
-                    if "charset" not in response.headers.get("Content-Type", "").lower():
-                        response.encoding = "utf-8"  # requests would fall back to ISO-8859-1
-                    return response
-                if response.status_code in THROTTLE_STATUSES:  # a short Retry-After would not clear a block
-                    wait = max(self._retry_after(response) or 0.0, self._backoff(attempt, throttled=True))
-                else:
+                status = response.status_code
+                if status in THROTTLE_STATUSES:
+                    if blocks == 0:
+                        self._slow_down()
+                    # a short Retry-After would not clear a block
+                    wait = max(self._retry_after(response) or 0.0, BLOCK_WAITS[min(blocks, len(BLOCK_WAITS) - 1)])
+                    if waited + wait > self.block_wait:
+                        return self._done(response)
+                    blocks += 1
+                    waited += wait
+                    log.warning("%s: сайт ограничил доступ (HTTP %d), жду %s — до %s", url, status,
+                                _duration(wait), time.strftime("%H:%M", time.localtime(time.time() + wait)))
+                elif status in RETRY_STATUSES and attempt < self.retries:
                     wait = self._retry_after(response) or self._backoff(attempt)
-                reason = f"HTTP {response.status_code}"
-            attempt += 1
-            log.warning("%s: %s, повтор %d/%d через %.0f с", url, reason, attempt, self.retries, wait)
+                    attempt += 1
+                    log.warning("%s: HTTP %d, повтор %d/%d через %.0f с", url, status, attempt, self.retries, wait)
+                else:
+                    self._calm_down()
+                    return self._done(response)
             self._sleep(wait)
+
+    @staticmethod
+    def _done(response: requests.Response) -> requests.Response:
+        if "charset" not in response.headers.get("Content-Type", "").lower():
+            response.encoding = "utf-8"  # requests would fall back to ISO-8859-1
+        return response
+
+    def _slow_down(self) -> None:
+        """A rate limit means we were too fast: double the pause between requests."""
+        self._calm_requests = 0
+        if self.base_delay <= 0:
+            return
+        delay = min(MAX_DELAY, max(self.delay * 2, 3.0))
+        if delay > self.delay:
+            self.delay = delay
+            log.warning("Пауза между запросами увеличена до %.0f с", delay)
+
+    def _calm_down(self) -> None:
+        """After a long stretch without rate limits, shorten the pause again, down to the original."""
+        if self.delay <= self.base_delay:
+            return
+        self._calm_requests += 1
+        if self._calm_requests >= SPEED_UP_AFTER:
+            self._calm_requests = 0
+            self.delay = max(self.base_delay, self.delay / 1.5)
+            log.info("Пауза между запросами уменьшена до %.1f с", self.delay)
 
     def _throttle(self) -> None:
         if self.delay > 0:
@@ -117,16 +165,14 @@ class KrishaClient:
     def _check_blocked(response: requests.Response, url: str) -> None:
         if response.status_code in THROTTLE_STATUSES:
             raise SiteBlocked(
-                f"krisha.kz ограничил доступ (HTTP {response.status_code}) для {url}. "
-                "Подождите и запустите ту же команду с --resume (лучше и с большим --delay): "
+                f"krisha.kz ограничил доступ (HTTP {response.status_code}) для {url} и не снял ограничение "
+                "за время ожидания (--block-wait). Запустите ту же команду с --resume позже: "
                 "уже сохранённые объявления не будут скачиваться заново"
             )
 
     @staticmethod
-    def _backoff(attempt: int, throttled: bool = False) -> float:
-        """2, 4, 8 s for server errors; 30, 60, 120 s when the site asks us to slow down."""
-        if throttled:
-            return min(120.0, 30.0 * 2 ** attempt)
+    def _backoff(attempt: int) -> float:
+        """2, 4, 8 s… for server and network errors."""
         return min(60.0, 2.0 ** (attempt + 1))
 
     @staticmethod
@@ -143,3 +189,7 @@ class KrishaClient:
             when = when.replace(tzinfo=timezone.utc)
         seconds = (when - datetime.now(timezone.utc)).total_seconds()
         return min(seconds, MAX_RETRY_AFTER) if seconds > 0 else None
+
+
+def _duration(seconds: float) -> str:
+    return f"{seconds / 60:.0f} мин" if seconds >= 60 else f"{seconds:.0f} с"

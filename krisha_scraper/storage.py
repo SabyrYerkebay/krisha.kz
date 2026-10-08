@@ -79,6 +79,7 @@ class Writer:
         self.resumed = len(existing)
         self.saved_keys = {key for key in map(record_key, existing) if key is not None}
         self._progress = progress or {"next_page": {}, "done": []}
+        self._progress.setdefault("continue", {})
 
     def write(self, record: dict) -> None:
         self._write(record)
@@ -97,11 +98,17 @@ class Writer:
         self._progress["next_page"][search] = page + 1
         self._progress_changed()
 
-    def finish_search(self, search: str) -> None:
+    def finish_search(self, search: str, continue_with: str | None = None) -> None:
+        """The search's results ended; a price-sorted one cut off by the page limit goes on as ``continue_with``."""
         self._progress["next_page"].pop(search, None)
         if search not in self._progress["done"]:
             self._progress["done"].append(search)
+        if continue_with:
+            self._progress["continue"][search] = continue_with
         self._progress_changed()
+
+    def continuation(self, search: str) -> str | None:
+        return self._progress["continue"].get(search)
 
     def _write(self, record: dict) -> None:
         raise NotImplementedError
@@ -340,7 +347,7 @@ def _load_progress(path: Path) -> dict | None:
         with open(file, encoding="utf-8") as stream:
             progress = json.load(stream)
         if not (isinstance(progress.get("next_page"), dict) and isinstance(progress.get("done"), list)
-                and isinstance(progress.get("records", 0), int)):
+                and isinstance(progress.get("continue", {}), dict) and isinstance(progress.get("records", 0), int)):
             raise ValueError("неожиданный формат")
     except (OSError, ValueError, AttributeError) as exc:
         log.warning("Не удалось прочитать %s (%s): поиски начнутся с первой страницы", file.name, exc)

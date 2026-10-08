@@ -2,6 +2,7 @@ import csv
 import json
 import logging
 from pathlib import Path
+from urllib.parse import parse_qsl, urlsplit
 
 import pytest
 import requests
@@ -104,7 +105,7 @@ def test_page_without_cards_is_a_stub_not_the_end():
 def test_search_with_nothing_found_finishes():
     finished = []
     client = FakeClient({page_url(SEARCH_URL, 1): search_html([], total=0)})
-    assert list(iter_search(client, SEARCH_URL, on_finished=lambda: finished.append(True))) == []
+    assert list(iter_search(client, SEARCH_URL, on_finished=lambda page, total: finished.append(True))) == []
     assert finished == [True]
 
 
@@ -183,7 +184,7 @@ def test_warns_when_search_is_larger_than_the_site_pages_through(total, last_pag
     client = FakeClient({page_url(SEARCH_URL, 1): search_html([1], last_page=last_page, total=total)})
     with caplog.at_level(logging.WARNING):
         list(iter_search(client, SEARCH_URL, max_pages=1))
-    assert ("разбейте поиск" in caplog.text) is warned
+    assert ("sort_by=price-asc" in caplog.text) is warned
 
 
 def test_scrape_single_listing_url(tmp_path):
@@ -670,3 +671,68 @@ def test_stub_during_resume_leaves_every_search_open(tmp_path):
     assert set(site.ids) <= saved
     progress = json.loads(storage.progress_path(out).read_text(encoding="utf-8"))
     assert sorted(progress["done"]) == sorted([SEARCH_URL, page_url(other, 1)])
+
+
+PRICE_SORTED = SEARCH_URL + "?sort_by=price-asc"
+
+
+class PricedSite:
+    """A price-sorted search where each listing's id is its price and the paginator stops at ``max_pages``.
+
+    ``hot`` listings are shown on top of every page out of price order; ``block_after`` requests
+    the site answers with a rate limit, once.
+    """
+
+    def __init__(self, prices, max_pages=5, hot=(), block_after=None):
+        self.prices = sorted(prices)
+        self.max_pages = max_pages
+        self.hot = list(hot)
+        self.block_after = block_after
+        self.requested = []
+
+    def get(self, url):
+        self.requested.append(url)
+        if self.block_after is not None and len(self.requested) > self.block_after:
+            self.block_after = None
+            raise SiteBlocked("HTTP 468")
+        query = dict(parse_qsl(urlsplit(url).query))
+        low = int(query.get("das[price][from]", 0))
+        items = [p for p in self.prices if p >= low]
+        last_page = max(1, min(self.max_pages, -(-len(items) // 20)))
+        page = min(int(query.get("page", 1)), last_page)
+        return search_html(self.hot + items[(page - 1) * 20:page * 20], last_page=last_page, total=len(items))
+
+
+@pytest.mark.parametrize("hot", [0, 4])
+def test_price_sorted_search_goes_past_the_page_limit(tmp_path, hot):
+    prices = list(range(1_000, 1_000 + 330 * 7, 7))  # 330 listings, 100 reachable per search
+    site = PricedSite(prices, hot=prices[200:200 + hot])
+    out = tmp_path / "out.jsonl"
+    with open_writer(out) as writer:
+        scrape(site, [PRICE_SORTED], writer)
+
+    saved = [r["id"] for r in storage.JsonLinesWriter.load(out)]
+    assert sorted(saved) == prices  # all of them, each once
+
+
+def test_unsorted_search_stops_at_the_page_limit(tmp_path):
+    site = PricedSite(range(1_000, 1_330))
+    out = tmp_path / "out.jsonl"
+    with open_writer(out) as writer:
+        assert scrape(site, [SEARCH_URL], writer) == 100
+
+
+def test_resume_in_the_middle_of_a_price_chain(tmp_path):
+    prices = list(range(1_000, 1_450))
+    out = tmp_path / "out.csv"
+    with pytest.raises(SiteBlocked):
+        with open_writer(out) as writer:
+            scrape(PricedSite(prices, block_after=13), [PRICE_SORTED], writer)
+
+    site = PricedSite(prices)
+    with open_writer(out, resume=True) as writer:
+        scrape(site, [PRICE_SORTED], writer, skip=writer.saved_keys)
+
+    saved = [storage.record_key(r) for r in storage.CsvWriter.load(out)]
+    assert sorted(saved) == prices
+    assert page_url(PRICE_SORTED, 1) not in site.requested  # the first price range was not walked again

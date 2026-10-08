@@ -161,19 +161,46 @@ def test_retries_krisha_468_with_long_pauses():
     assert client.sleeps == [30.0, 60.0]
 
 
-def test_persistent_rate_limit_raises_site_blocked():
+def test_rate_limit_longer_than_block_wait_raises_site_blocked():
     client = make_client({
         "https://krisha.kz/robots.txt": [FakeResponse(text="")],
         "https://krisha.kz/a/show/1": [FakeResponse(468)] * 4,
-    })
+    }, block_wait=210)
     with pytest.raises(SiteBlocked, match="--resume"):
         client.get("https://krisha.kz/a/show/1")
-    assert client.sleeps == [30.0, 60.0, 120.0]
+    assert client.sleeps == [30, 60, 120]  # the next wait (5 min) would go past --block-wait
+
+
+def test_waits_out_a_rate_limit_of_half_an_hour():
+    client = make_client({
+        "https://krisha.kz/robots.txt": [FakeResponse(text="")],
+        "https://krisha.kz/a/show/1": [FakeResponse(468)] * 7 + [FakeResponse(text="ok")],
+    })
+    assert client.get("https://krisha.kz/a/show/1") == "ok"
+    assert client.sleeps == [30, 60, 120, 300, 600, 900, 1200]
+
+
+def test_rate_limit_slows_the_client_down_then_it_recovers():
+    client = make_client({
+        "https://krisha.kz/robots.txt": [FakeResponse(text="")],
+        "https://krisha.kz/a/show/1": [FakeResponse(468), FakeResponse(468), FakeResponse(text="ok")],
+        "https://krisha.kz/a/show/2": [FakeResponse(text="ok")] * 600,
+    })
+    client.delay = client.base_delay = 1.5
+    client.get("https://krisha.kz/a/show/1")
+    assert client.delay == 3.0  # doubled once per rate limit, not once per retry
+
+    for _ in range(300):
+        client.get("https://krisha.kz/a/show/2")
+    assert client.delay == 2.0
+    for _ in range(300):
+        client.get("https://krisha.kz/a/show/2")
+    assert client.delay == 1.5  # never below the pause the user chose
 
 
 def test_rate_limited_robots_raises_site_blocked():
     # not cached as "no robots.txt, everything allowed"
-    client = make_client({"https://krisha.kz/robots.txt": [FakeResponse(468)] * 2}, retries=1)
+    client = make_client({"https://krisha.kz/robots.txt": [FakeResponse(468)] * 2}, block_wait=30)
     with pytest.raises(SiteBlocked):
         client.get("https://krisha.kz/a/show/1")
 

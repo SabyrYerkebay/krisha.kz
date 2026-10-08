@@ -107,7 +107,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout", type=_positive_float, default=30.0,
                         help="таймаут запроса, секунд (по умолчанию %(default)s)")
     parser.add_argument("--retries", type=_non_negative_int, default=3,
-                        help="повторы при ошибках сети и HTTP 429/5xx (по умолчанию %(default)s)")
+                        help="повторы при ошибках сети и HTTP 5xx (по умолчанию %(default)s)")
+    parser.add_argument("--block-wait", type=_non_negative_float, default=120, metavar="MIN",
+                        help="сколько минут ждать, если сайт ограничил доступ (HTTP 468), прежде чем "
+                             "остановиться (по умолчанию %(default)s)")
     parser.add_argument("--user-agent", default=DEFAULT_USER_AGENT, help="заголовок User-Agent")
     parser.add_argument("-v", "--verbose", action="store_true", help="подробный лог")
     return parser
@@ -135,7 +138,7 @@ def main(argv: list[str] | None = None) -> int:
             log.info("В файле уже %d объявлений: лимит --limit %d достигнут", writer.resumed, args.limit)
 
     client = KrishaClient(delay=args.delay, timeout=args.timeout, retries=args.retries,
-                          user_agent=args.user_agent)
+                          user_agent=args.user_agent, block_wait=args.block_wait * 60)
     status = 0
     save_error = None
     try:
