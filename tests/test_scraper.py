@@ -736,3 +736,48 @@ def test_resume_in_the_middle_of_a_price_chain(tmp_path):
     saved = [storage.record_key(r) for r in storage.CsvWriter.load(out)]
     assert sorted(saved) == prices
     assert page_url(PRICE_SORTED, 1) not in site.requested  # the first price range was not walked again
+
+
+def test_dropped_connection_stops_the_run_instead_of_saving_a_listing_without_details(tmp_path):
+    client = FakeClient({
+        page_url(SEARCH_URL, 1): search_html([1, 2, 3], last_page=1),
+        "https://krisha.kz/a/show/1": listing_html(1),
+        "https://krisha.kz/a/show/2": requests.ConnectionError("no network"),
+        "https://krisha.kz/a/show/3": requests.HTTPError("404 Not Found"),
+    })
+    out = tmp_path / "out.jsonl"
+    with pytest.raises(requests.ConnectionError):
+        with open_writer(out) as writer:
+            scrape(client, [SEARCH_URL], writer, details=True)
+    assert [r["id"] for r in storage.JsonLinesWriter.load(out)] == [1]  # 2 is left for --resume
+
+    client.pages["https://krisha.kz/a/show/2"] = listing_html(2)
+    with open_writer(out, resume=True) as writer:
+        scrape(client, [SEARCH_URL], writer, details=True, skip=writer.saved_keys)
+    records = storage.JsonLinesWriter.load(out)
+    assert [r["id"] for r in records] == [1, 2, 3]
+    assert records[1]["lat"] == 43.2  # fetched with details this time
+    assert "lat" not in records[2]  # a removed listing is kept as its card
+
+
+def test_price_sorted_search_finished_by_an_older_version_is_walked_again(tmp_path):
+    out = tmp_path / "out.jsonl"
+    prices = list(range(1_000, 1_330))
+    with open_writer(out) as writer:
+        scrape(PricedSite(prices), [SEARCH_URL], writer)  # stands in for the old page-1000 stop
+        writer.write({"id": 0})
+    # what a version without the price chain left behind
+    storage.progress_path(out).write_text(json.dumps(
+        {"next_page": {}, "done": [PRICE_SORTED], "records": 101}), encoding="utf-8")
+
+    with open_writer(out, resume=True) as writer:
+        scrape(PricedSite(prices), [PRICE_SORTED], writer, skip=writer.saved_keys)
+    saved = {r["id"] for r in storage.JsonLinesWriter.load(out)}
+    assert set(prices) <= saved
+
+    progress = json.loads(storage.progress_path(out).read_text(encoding="utf-8"))
+    client = PricedSite(prices)
+    with open_writer(out, resume=True) as writer:  # now finished for real: nothing to fetch
+        scrape(client, [PRICE_SORTED], writer, skip=writer.saved_keys)
+    assert client.requested == []
+    assert progress["continue"]

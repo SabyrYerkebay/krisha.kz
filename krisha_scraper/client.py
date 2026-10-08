@@ -28,6 +28,7 @@ BLOCK_WAITS = (30, 60, 120, 300, 600, 900, 1200, 1800)  # seconds; the last one 
 DEFAULT_BLOCK_WAIT = 2 * 3600  # give up on a rate limit that lasts longer than this
 MAX_DELAY = 20.0  # the pause between requests grows up to this after rate limits
 SPEED_UP_AFTER = 300  # requests without a rate limit before the pause is shortened again
+ERROR_WAITS = (5, 15, 30, 60, 120, 300)  # seconds between retries after network or server errors
 
 
 class RobotsDisallowed(Exception):
@@ -43,7 +44,7 @@ class KrishaClient:
         self,
         delay: float = 1.5,
         timeout: float = 30.0,
-        retries: int = 3,
+        retries: int = 8,
         user_agent: str = DEFAULT_USER_AGENT,
         session: requests.Session | None = None,
         block_wait: float = DEFAULT_BLOCK_WAIT,
@@ -62,6 +63,7 @@ class KrishaClient:
         self._robots: dict[str, RobotsRules] = {}
         self._last_request = 0.0
         self._calm_requests = 0
+        self._blocked_pace = 0.0  # the longest pause between requests that still got rate-limited
         self._sleep = time.sleep
         self._clock = time.monotonic
 
@@ -139,19 +141,25 @@ class KrishaClient:
         self._calm_requests = 0
         if self.base_delay <= 0:
             return
+        self._blocked_pace = max(self._blocked_pace, self.delay)
         delay = min(MAX_DELAY, max(self.delay * 2, 3.0))
         if delay > self.delay:
             self.delay = delay
             log.warning("Пауза между запросами увеличена до %.0f с", delay)
 
     def _calm_down(self) -> None:
-        """After a long stretch without rate limits, shorten the pause again, down to the original."""
-        if self.delay <= self.base_delay:
+        """After a long stretch without rate limits, shorten the pause again.
+
+        Never back to a pace that got rate-limited: a quarter above it at least, and not
+        below the pause the user chose.
+        """
+        floor = max(self.base_delay, self._blocked_pace * 1.25)
+        if self.delay <= floor:
             return
         self._calm_requests += 1
         if self._calm_requests >= SPEED_UP_AFTER:
             self._calm_requests = 0
-            self.delay = max(self.base_delay, self.delay / 1.5)
+            self.delay = max(floor, self.delay / 1.5)
             log.info("Пауза между запросами уменьшена до %.1f с", self.delay)
 
     def _throttle(self) -> None:
@@ -172,8 +180,8 @@ class KrishaClient:
 
     @staticmethod
     def _backoff(attempt: int) -> float:
-        """2, 4, 8 s… for server and network errors."""
-        return min(60.0, 2.0 ** (attempt + 1))
+        """5 s, 15 s, 30 s, 1, 2, 5, 5… min for server and network errors: rides out a dropped Wi-Fi."""
+        return float(ERROR_WAITS[min(attempt, len(ERROR_WAITS) - 1)])
 
     @staticmethod
     def _retry_after(response: requests.Response) -> float | None:

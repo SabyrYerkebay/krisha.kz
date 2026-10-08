@@ -106,8 +106,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="пауза между запросами, секунд (по умолчанию %(default)s)")
     parser.add_argument("--timeout", type=_positive_float, default=30.0,
                         help="таймаут запроса, секунд (по умолчанию %(default)s)")
-    parser.add_argument("--retries", type=_non_negative_int, default=3,
-                        help="повторы при ошибках сети и HTTP 5xx (по умолчанию %(default)s)")
+    parser.add_argument("--retries", type=_non_negative_int, default=8,
+                        help="повторы при ошибках сети и HTTP 5xx, с паузами 5 с, 15 с, 30 с, 1, 2, 5 мин… "
+                             "(по умолчанию %(default)s — около 25 минут)")
     parser.add_argument("--block-wait", type=_non_negative_float, default=120, metavar="MIN",
                         help="сколько минут ждать, если сайт ограничил доступ (HTTP 468), прежде чем "
                              "остановиться (по умолчанию %(default)s)")

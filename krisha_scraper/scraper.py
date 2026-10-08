@@ -240,12 +240,18 @@ def resume_page(client: KrishaClient, search_url: str, next_page: int, saved: se
 
 
 def with_details(client: KrishaClient, card: dict) -> dict:
-    """The card merged with data from its listing page; the card alone if that fails."""
+    """The card merged with data from its listing page; the card alone if that page cannot be had.
+
+    A connection that is still down after every retry stops the run instead: the
+    listing is not saved, so --resume fetches it again.
+    """
     if not card.get("url"):
         return card
     try:
         detail = parse_listing_page(client.get(card["url"]), card["url"])
-    except (RobotsDisallowed, requests.RequestException) as exc:
+    except (requests.ConnectionError, requests.Timeout):
+        raise
+    except (RobotsDisallowed, requests.RequestException) as exc:  # e.g. a removed or broken listing
         log.warning("Не удалось открыть %s: %s", card["url"], exc)
         return card
     merged = dict(card)

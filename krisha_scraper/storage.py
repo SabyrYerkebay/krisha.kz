@@ -9,6 +9,7 @@ import os
 import time
 from collections.abc import Callable, Iterable
 from pathlib import Path
+from urllib.parse import parse_qsl, urlsplit
 
 log = logging.getLogger(__name__)
 
@@ -79,7 +80,11 @@ class Writer:
         self.resumed = len(existing)
         self.saved_keys = {key for key in map(record_key, existing) if key is not None}
         self._progress = progress or {"next_page": {}, "done": []}
-        self._progress.setdefault("continue", {})
+        continuations = self._progress.setdefault("continue", {})
+        # versions before the price chain finished price-sorted searches at the page limit without
+        # recording whether more was left: walk those once more (saved listings are skipped)
+        self._progress["done"] = [search for search in self._progress["done"]
+                                  if search in continuations or not _sorted_by_price(search)]
 
     def write(self, record: dict) -> None:
         self._write(record)
@@ -103,8 +108,7 @@ class Writer:
         self._progress["next_page"].pop(search, None)
         if search not in self._progress["done"]:
             self._progress["done"].append(search)
-        if continue_with:
-            self._progress["continue"][search] = continue_with
+        self._progress["continue"][search] = continue_with  # None: the results really ended
         self._progress_changed()
 
     def continuation(self, search: str) -> str | None:
@@ -365,6 +369,10 @@ def _keep_leftover_tmp(path: Path) -> Path | None:
     log.warning("Найден %s от прошлого запуска (там могут быть данные новее основного файла): "
                 "переименован в %s", tmp.name, leftover.name)
     return leftover
+
+
+def _sorted_by_price(search: str) -> bool:
+    return ("sort_by", "price-asc") in parse_qsl(urlsplit(search).query)
 
 
 def _json_line(record: dict) -> str:

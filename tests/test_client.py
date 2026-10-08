@@ -119,7 +119,7 @@ def test_retries_on_server_and_network_errors():
         ],
     })
     assert client.get("https://krisha.kz/a/show/1") == "ok"
-    assert client.sleeps == [7.0, 4.0]
+    assert client.sleeps == [7.0, 15.0]
 
 
 @pytest.mark.parametrize("retry_after, expected", [("5", 30.0), ("90", 90.0)])
@@ -195,7 +195,19 @@ def test_rate_limit_slows_the_client_down_then_it_recovers():
     assert client.delay == 2.0
     for _ in range(300):
         client.get("https://krisha.kz/a/show/2")
-    assert client.delay == 1.5  # never below the pause the user chose
+    assert client.delay == 1.875  # never back to the 1.5 s that got rate-limited
+
+
+def test_pace_settles_above_every_pace_that_got_rate_limited():
+    client = make_client({"https://krisha.kz/robots.txt": [FakeResponse(text="")]})
+    client.delay = client.base_delay = 1.5
+    for _ in range(3):  # each time the client sped up, the site limited it again
+        client._slow_down()
+        for _ in range(3000):
+            client._calm_down()
+    blocked = client._blocked_pace
+    assert client.delay >= blocked * 1.25
+    assert blocked > 1.5
 
 
 def test_rate_limited_robots_raises_site_blocked():
@@ -212,7 +224,16 @@ def test_gives_up_after_retries():
     }, retries=2)
     with pytest.raises(requests.HTTPError):
         client.get("https://krisha.kz/a/show/1")
-    assert client.sleeps == [2.0, 4.0]
+    assert client.sleeps == [5.0, 15.0]
+
+
+def test_rides_out_a_few_minutes_without_network():
+    client = make_client({
+        "https://krisha.kz/robots.txt": [FakeResponse(text="")],
+        "https://krisha.kz/a/show/1": [requests.ConnectionError("no network")] * 6 + [FakeResponse(text="ok")],
+    })
+    assert client.get("https://krisha.kz/a/show/1") == "ok"
+    assert client.sleeps == [5, 15, 30, 60, 120, 300]
 
 
 def test_defaults_to_utf8_without_charset():
